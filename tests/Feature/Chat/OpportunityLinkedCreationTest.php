@@ -1,0 +1,170 @@
+<?php
+
+declare(strict_types=1);
+
+use App\Actions\Opportunity\CreateOpportunity;
+use App\Actions\Opportunity\UpdateOpportunity;
+use App\Models\Company;
+use App\Models\Opportunity;
+use App\Models\People;
+use App\Models\User;
+use Illuminate\JsonSchema\JsonSchemaTypeFactory;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\ValidationException;
+use Laravel\Ai\Tools\Request;
+use Relaticle\Chat\Models\PendingAction;
+use Relaticle\Chat\Tools\Opportunity\CreateOpportunityTool;
+use Relaticle\Chat\Tools\Opportunity\UpdateOpportunityTool;
+
+mutates(CreateOpportunityTool::class);
+mutates(UpdateOpportunityTool::class);
+mutates(CreateOpportunity::class);
+mutates(UpdateOpportunity::class);
+
+beforeEach(function (): void {
+    $this->user = User::factory()->withPersonalWorkspace()->create();
+    $this->workspace = $this->user->currentWorkspace;
+    Auth::guard('web')->setUser($this->user);
+
+    DB::table('agent_conversations')->insert([
+        'id' => '019df800-4444-7000-8000-000000000001',
+        'participant_type' => 'user',
+        'participant_id' => (string) $this->user->getKey(),
+        'workspace_id' => $this->workspace->getKey(),
+        'title' => '',
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+});
+
+it('CreateOpportunityTool wraps entity fields inside a records[] schema', function (): void {
+    $tool = resolve(CreateOpportunityTool::class);
+    $schema = $tool->schema(new JsonSchemaTypeFactory);
+
+    expect($schema)->toHaveKey('records');
+});
+
+it('persists company_id and contact_id in the pending action data', function (): void {
+    $company = Company::factory()->for($this->workspace)->create(['name' => 'Acme']);
+    $contact = People::factory()->for($this->workspace)->create(['name' => 'Angel']);
+
+    $tool = resolve(CreateOpportunityTool::class);
+    $tool->setConversationId('019df800-4444-7000-8000-000000000001');
+
+    $tool->handle(new Request([
+        'records' => [['name' => 'Acme deal', 'company_id' => (string) $company->id, 'contact_id' => (string) $contact->id]],
+    ]));
+
+    $pending = PendingAction::query()
+        ->where('workspace_id', $this->workspace->getKey())
+        ->where('entity_type', 'opportunity')
+        ->latest()
+        ->firstOrFail();
+
+    expect($pending->action_data)
+        ->toHaveKey('name', 'Acme deal')
+        ->toHaveKey('company_id', (string) $company->id)
+        ->toHaveKey('contact_id', (string) $contact->id);
+});
+
+it('approving an opportunity creates it linked to a company and contact', function (): void {
+    $company = Company::factory()->for($this->workspace)->create(['name' => 'Acme']);
+    $contact = People::factory()->for($this->workspace)->create(['name' => 'Angel']);
+
+    $opportunity = resolve(CreateOpportunity::class)->execute(
+        $this->user,
+        [
+            'name' => 'Acme deal',
+            'company_id' => (string) $company->id,
+            'contact_id' => (string) $contact->id,
+        ],
+    );
+
+    expect($opportunity)->toBeInstanceOf(Opportunity::class);
+    expect((string) $opportunity->company_id)->toBe((string) $company->id);
+    expect((string) $opportunity->contact_id)->toBe((string) $contact->id);
+});
+
+it('rejects cross-tenant company_id at the action layer', function (): void {
+    $other = User::factory()->withPersonalWorkspace()->create();
+    $foreign = Company::factory()->for($other->currentWorkspace)->create(['name' => 'Mallory Co']);
+
+    expect(fn () => resolve(CreateOpportunity::class)->execute(
+        $this->user,
+        ['name' => 'X', 'company_id' => (string) $foreign->id],
+    ))->toThrow(ValidationException::class);
+});
+
+it('rejects cross-tenant contact_id at the action layer', function (): void {
+    $other = User::factory()->withPersonalWorkspace()->create();
+    $foreign = People::factory()->for($other->currentWorkspace)->create(['name' => 'Mallory']);
+
+    expect(fn () => resolve(CreateOpportunity::class)->execute(
+        $this->user,
+        ['name' => 'X', 'contact_id' => (string) $foreign->id],
+    ))->toThrow(ValidationException::class);
+});
+
+it('renders linked company and contact names in the create proposal display data', function (): void {
+    $company = Company::factory()->for($this->workspace)->create(['name' => 'Acme']);
+    $contact = People::factory()->for($this->workspace)->create(['name' => 'Angel']);
+
+    $tool = resolve(CreateOpportunityTool::class);
+    $tool->setConversationId('019df800-4444-7000-8000-000000000001');
+
+    $tool->handle(new Request([
+        'records' => [['name' => 'Acme deal', 'company_id' => (string) $company->id, 'contact_id' => (string) $contact->id]],
+    ]));
+
+    $pending = PendingAction::query()
+        ->where('workspace_id', $this->workspace->getKey())
+        ->where('entity_type', 'opportunity')
+        ->latest()
+        ->firstOrFail();
+
+    $fields = collect($pending->display_data['fields'] ?? []);
+    $values = $fields->pluck('value')->all();
+
+    expect(implode(' ', array_filter($values, 'is_string')))
+        ->toContain('Acme')
+        ->toContain('Angel');
+});
+
+it('UpdateOpportunityTool renders linked names in the update proposal display data', function (): void {
+    $oldCompany = Company::factory()->for($this->workspace)->create(['name' => 'Old Co']);
+    $newCompany = Company::factory()->for($this->workspace)->create(['name' => 'New Co']);
+    $newContact = People::factory()->for($this->workspace)->create(['name' => 'Angel']);
+
+    $opportunity = Opportunity::factory()
+        ->for($this->workspace)
+        ->create(['name' => 'Existing deal', 'company_id' => $oldCompany->id]);
+
+    $tool = resolve(UpdateOpportunityTool::class);
+    $tool->setConversationId('019df800-4444-7000-8000-000000000001');
+
+    $tool->handle(new Request(['records' => [[
+        'id' => (string) $opportunity->id,
+        'company_id' => (string) $newCompany->id,
+        'contact_id' => (string) $newContact->id,
+    ]]]));
+
+    $pending = PendingAction::query()
+        ->where('workspace_id', $this->workspace->getKey())
+        ->where('entity_type', 'opportunity')
+        ->latest()
+        ->firstOrFail();
+
+    $fields = collect($pending->display_data['fields'] ?? []);
+    $labels = $fields->pluck('label')->all();
+
+    expect($labels)->toContain('Company');
+    expect($labels)->toContain('Point of Contact');
+
+    $companyField = $fields->firstWhere('label', 'Company');
+    $contactField = $fields->firstWhere('label', 'Point of Contact');
+
+    expect($companyField['old'] ?? '')->toBe('Old Co');
+    expect($companyField['new'] ?? '')->toBe('New Co');
+    expect($contactField['new'] ?? '')->toBe('Angel');
+});

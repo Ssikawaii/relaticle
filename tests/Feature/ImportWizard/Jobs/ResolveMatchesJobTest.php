@@ -1,0 +1,367 @@
+<?php
+
+declare(strict_types=1);
+
+use App\Events\WorkspaceCreated;
+use App\Models\CustomField;
+use App\Models\CustomFieldValue;
+use App\Models\People;
+use App\Models\User;
+use Filament\Facades\Filament;
+use Illuminate\Database\Eloquent\ModelNotFoundException;
+use Illuminate\Database\Events\QueryExecuted;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\Storage;
+use Relaticle\ImportWizard\Data\ColumnData;
+use Relaticle\ImportWizard\Data\RelationshipMatch;
+use Relaticle\ImportWizard\Enums\ImportEntityType;
+use Relaticle\ImportWizard\Enums\ImportStatus;
+use Relaticle\ImportWizard\Enums\RowMatchAction;
+use Relaticle\ImportWizard\Exceptions\ImportStoreException;
+use Relaticle\ImportWizard\Jobs\ResolveMatchesJob;
+use Relaticle\ImportWizard\Models\Import;
+use Relaticle\ImportWizard\Store\ImportStore;
+use Relaticle\ImportWizard\Support\MatchResolver;
+use Tests\Helpers\ImportExecutionFixture;
+
+mutates(ResolveMatchesJob::class, MatchResolver::class);
+
+beforeEach(function (): void {
+    Event::fake()->except([WorkspaceCreated::class]);
+
+    $this->user = User::factory()->withWorkspace()->create();
+    $this->actingAs($this->user);
+    $this->workspace = $this->user->currentWorkspace;
+
+    Filament::setTenant($this->workspace);
+});
+
+afterEach(function (): void {
+    if (isset($this->import)) {
+        ImportStore::delete($this->import->id);
+        $this->import->delete();
+    }
+});
+
+function createStoreForMatchResolution(
+    object $context,
+    array $headers,
+    array $rows,
+    array $mappings,
+): array {
+    $import = Import::factory()->create([
+        'workspace_id' => (string) $context->workspace->id,
+        'user_id' => (string) $context->user->id,
+        'entity_type' => ImportEntityType::People,
+        'file_name' => 'test.csv',
+        'status' => ImportStatus::Reviewing,
+        'total_rows' => count($rows),
+        'headers' => $headers,
+        'column_mappings' => collect($mappings)->map(fn (ColumnData $m) => $m->toArray())->all(),
+    ]);
+
+    $store = ImportStore::create($import->id);
+    $store->query()->insert($rows);
+
+    $store = ImportExecutionFixture::publish($store);
+
+    $context->import = $import;
+    $context->store = $store;
+
+    return [$import, $store];
+}
+
+function makeMatchRow(int $rowNumber, array $rawData, array $overrides = []): array
+{
+    return [
+        'row_number' => $rowNumber,
+        'raw_data' => json_encode($rawData),
+        'validation' => null,
+        'corrections' => null,
+        'skipped' => null,
+        'match_action' => null,
+        'matched_id' => null,
+        'relationships' => null,
+        ...$overrides,
+    ];
+}
+
+it('resolves all rows as Create when no match field mapped', function (): void {
+    createStoreForMatchResolution($this, ['Name'], [
+        makeMatchRow(2, ['Name' => 'John']),
+        makeMatchRow(3, ['Name' => 'Jane']),
+    ], [
+        ColumnData::toField(source: 'Name', target: 'name'),
+    ]);
+
+    (new ResolveMatchesJob($this->import->id, (string) $this->workspace->id))->handle();
+
+    $rows = $this->store->query()->get();
+    expect($rows)->toHaveCount(2)
+        ->and($rows->every(fn ($row) => $row->match_action === RowMatchAction::Create))->toBeTrue();
+});
+
+it('resolves Update when email matches existing record', function (): void {
+    $person = People::factory()->create([
+        'name' => 'Existing Person',
+        'workspace_id' => $this->workspace->id,
+    ]);
+
+    $emailField = CustomField::query()
+        ->withoutGlobalScopes()
+        ->where('tenant_id', $this->workspace->id)
+        ->where('entity_type', 'people')
+        ->where('code', 'emails')
+        ->first();
+
+    if ($emailField) {
+        CustomFieldValue::factory()->withJsonValue(['existing@test.com'])->create([
+            'custom_field_id' => $emailField->id,
+            'entity_type' => 'people',
+            'entity_id' => $person->id,
+            'tenant_id' => $this->workspace->id,
+        ]);
+    }
+
+    createStoreForMatchResolution($this, ['Name', 'Email'], [
+        makeMatchRow(2, ['Name' => 'John', 'Email' => 'existing@test.com']),
+    ], [
+        ColumnData::toField(source: 'Name', target: 'name'),
+        ColumnData::toField(source: 'Email', target: 'custom_fields_emails'),
+    ]);
+
+    (new ResolveMatchesJob($this->import->id, (string) $this->workspace->id))->handle();
+
+    $row = $this->store->query()->where('row_number', 2)->first();
+
+    if ($emailField) {
+        expect($row->match_action)->toBe(RowMatchAction::Update)
+            ->and($row->matched_id)->toBe((string) $person->id);
+    } else {
+        expect($row->match_action)->toBe(RowMatchAction::Create);
+    }
+});
+
+it('resolves Skip when id does not match existing record', function (): void {
+    createStoreForMatchResolution($this, ['ID', 'Name'], [
+        makeMatchRow(2, ['ID' => '99999', 'Name' => 'Ghost']),
+    ], [
+        ColumnData::toField(source: 'ID', target: 'id'),
+        ColumnData::toField(source: 'Name', target: 'name'),
+    ]);
+
+    (new ResolveMatchesJob($this->import->id, (string) $this->workspace->id))->handle();
+
+    $row = $this->store->query()->where('row_number', 2)->first();
+    expect($row->match_action)->toBe(RowMatchAction::Skip);
+});
+
+it('does not clear relationships column', function (): void {
+    $companyMatch = RelationshipMatch::create('company', 'Acme Corp');
+
+    createStoreForMatchResolution($this, ['Name'], [
+        makeMatchRow(2, ['Name' => 'John'], [
+            'relationships' => json_encode([$companyMatch->toArray()]),
+        ]),
+    ], [
+        ColumnData::toField(source: 'Name', target: 'name'),
+    ]);
+
+    (new ResolveMatchesJob($this->import->id, (string) $this->workspace->id))->handle();
+
+    $row = $this->store->query()->where('row_number', 2)->first();
+    expect($row->relationships)->not->toBeNull()
+        ->and($row->relationships)->toHaveCount(1)
+        ->and($row->relationships[0]->relationship)->toBe('company');
+});
+
+it('resets previous match resolutions when re-resolving', function (): void {
+    createStoreForMatchResolution($this, ['Name'], [
+        makeMatchRow(2, ['Name' => 'John'], [
+            'match_action' => RowMatchAction::Update->value,
+            'matched_id' => '999',
+        ]),
+    ], [
+        ColumnData::toField(source: 'Name', target: 'name'),
+    ]);
+
+    (new ResolveMatchesJob($this->import->id, (string) $this->workspace->id))->handle();
+
+    $row = $this->store->query()->where('row_number', 2)->first();
+    expect($row->match_action)->toBe(RowMatchAction::Create)
+        ->and($row->matched_id)->toBeNull();
+});
+
+it('marks unmatched rows as Create when mixed matched and empty values', function (): void {
+    $person = People::factory()->create([
+        'name' => 'Existing',
+        'workspace_id' => $this->workspace->id,
+    ]);
+
+    createStoreForMatchResolution($this, ['ID', 'Name'], [
+        makeMatchRow(2, ['ID' => (string) $person->id, 'Name' => 'Updated'], []),
+        makeMatchRow(3, ['ID' => '', 'Name' => 'New Person'], []),
+    ], [
+        ColumnData::toField(source: 'ID', target: 'id'),
+        ColumnData::toField(source: 'Name', target: 'name'),
+    ]);
+
+    (new ResolveMatchesJob($this->import->id, (string) $this->workspace->id))->handle();
+
+    $matched = $this->store->query()->where('row_number', 2)->first();
+    $unmatched = $this->store->query()->where('row_number', 3)->first();
+
+    expect($matched->match_action)->toBe(RowMatchAction::Update)
+        ->and($matched->matched_id)->toBe((string) $person->id)
+        ->and($unmatched->match_action)->toBe(RowMatchAction::Skip);
+});
+
+it('resolves Update when CSV email column contains comma-separated values matching existing record', function (): void {
+    $person = People::factory()->create([
+        'name' => 'Existing Person',
+        'workspace_id' => $this->workspace->id,
+    ]);
+
+    $emailField = CustomField::query()
+        ->withoutGlobalScopes()
+        ->where('tenant_id', $this->workspace->id)
+        ->where('entity_type', 'people')
+        ->where('code', 'emails')
+        ->first();
+
+    if (! $emailField) {
+        $this->markTestSkipped('No email custom field seeded for workspace');
+    }
+
+    CustomFieldValue::factory()->withJsonValue(['existing@test.com', 'other@test.com'])->create([
+        'custom_field_id' => $emailField->id,
+        'entity_type' => 'people',
+        'entity_id' => $person->id,
+        'tenant_id' => $this->workspace->id,
+    ]);
+
+    createStoreForMatchResolution($this, ['Name', 'Email'], [
+        makeMatchRow(2, ['Name' => 'John', 'Email' => 'existing@test.com, new@test.com']),
+    ], [
+        ColumnData::toField(source: 'Name', target: 'name'),
+        ColumnData::toField(source: 'Email', target: 'custom_fields_emails'),
+    ]);
+
+    (new ResolveMatchesJob($this->import->id, (string) $this->workspace->id))->handle();
+
+    $row = $this->store->query()->where('row_number', 2)->first();
+
+    expect($row->match_action)->toBe(RowMatchAction::Update)
+        ->and($row->matched_id)->toBe((string) $person->id);
+});
+
+it('handles missing import gracefully', function (): void {
+    (new ResolveMatchesJob('nonexistent-id', (string) $this->workspace->id))->handle();
+})->throws(ModelNotFoundException::class);
+
+describe('on a remote store disk', function (): void {
+    beforeEach(function (): void {
+        useRemoteImportStore();
+    });
+
+    it('writes an update match for an existing record into the remote store', function (): void {
+        $person = People::factory()->create([
+            'name' => 'Existing',
+            'workspace_id' => $this->workspace->id,
+        ]);
+
+        createStoreForMatchResolution($this, ['ID', 'Name'], [
+            makeMatchRow(2, ['ID' => (string) $person->id, 'Name' => 'Updated']),
+        ], [
+            ColumnData::toField(source: 'ID', target: 'id'),
+            ColumnData::toField(source: 'Name', target: 'name'),
+        ]);
+
+        (new ResolveMatchesJob($this->import->id))->handle();
+
+        $row = ImportStore::forRead($this->import->id)->query()->where('row_number', 2)->first();
+
+        expect($row->match_action)->toBe(RowMatchAction::Update)
+            ->and($row->matched_id)->toBe((string) $person->id);
+    });
+
+    it('writes a create match for every row when no match field is mapped', function (): void {
+        createStoreForMatchResolution($this, ['Name'], [
+            makeMatchRow(2, ['Name' => 'John']),
+            makeMatchRow(3, ['Name' => 'Jane']),
+        ], [
+            ColumnData::toField(source: 'Name', target: 'name'),
+        ]);
+
+        (new ResolveMatchesJob($this->import->id))->handle();
+
+        $rows = ImportStore::forRead($this->import->id)->query()->get();
+
+        expect($rows)->toHaveCount(2)
+            ->and($rows->every(fn ($row): bool => $row->match_action === RowMatchAction::Create))->toBeTrue();
+    });
+
+    it('fails with a lock timeout instead of writing when another writer holds the store', function (): void {
+        createStoreForMatchResolution($this, ['Name'], [
+            makeMatchRow(2, ['Name' => 'John']),
+        ], [
+            ColumnData::toField(source: 'Name', target: 'name'),
+        ]);
+
+        $held = Cache::lock(importStoreLockName($this->import->id), 150);
+        $held->get();
+        config()->set('import-wizard.store.lock.wait.job', 0);
+
+        expect(fn () => (new ResolveMatchesJob($this->import->id))->handle())
+            ->toThrow(ImportStoreException::class);
+
+        $held->release();
+
+        expect(ImportStore::forRead($this->import->id)->query()->first()->match_action)->toBeNull();
+    });
+
+    it('does not resolve or upload when its batch is cancelled before it takes the lock', function (): void {
+        createStoreForMatchResolution($this, ['Name'], [
+            makeMatchRow(2, ['Name' => 'John']),
+        ], [
+            ColumnData::toField(source: 'Name', target: 'name'),
+        ]);
+
+        $remoteFile = Storage::disk('s3')->getConfig()['root']."/imports/{$this->import->id}.sqlite";
+        touch($remoteFile, time() - 3600);
+        clearstatcache();
+        $modifiedAt = Storage::disk('s3')->lastModified("imports/{$this->import->id}.sqlite");
+
+        [$job] = (new ResolveMatchesJob($this->import->id))->withFakeBatch();
+
+        Event::fake()->except([WorkspaceCreated::class, QueryExecuted::class]);
+
+        DB::listen(function (QueryExecuted $query) use ($job): void {
+            if (str_contains($query->sql, 'from "imports"')) {
+                $job->batch()->cancel();
+            }
+        });
+
+        $job->handle();
+
+        clearstatcache();
+        expect(Storage::disk('s3')->lastModified("imports/{$this->import->id}.sqlite"))->toBe($modifiedAt)
+            ->and(ImportStore::forRead($this->import->id)->query()->first()->match_action)->toBeNull();
+    });
+
+    it('returns quietly when the store was deleted', function (): void {
+        createStoreForMatchResolution($this, ['Name'], [
+            makeMatchRow(2, ['Name' => 'John']),
+        ], [
+            ColumnData::toField(source: 'Name', target: 'name'),
+        ]);
+
+        ImportStore::delete($this->import->id);
+
+        (new ResolveMatchesJob($this->import->id))->handle();
+
+        expect(ImportStore::exists($this->import->id))->toBeFalse();
+    });
+});

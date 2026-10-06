@@ -1,0 +1,111 @@
+<?php
+
+declare(strict_types=1);
+
+use App\Enums\CustomFields\CompanyField;
+use App\Jobs\FetchFaviconForCompany;
+use App\Models\Company;
+use App\Models\CustomField;
+use App\Models\CustomFieldValue;
+use App\Models\User;
+use App\Observers\CompanyObserver;
+use Filament\Facades\Filament;
+use Illuminate\Support\Facades\Bus;
+
+mutates(CompanyObserver::class);
+
+beforeEach(function (): void {
+    $this->user = User::factory()->withWorkspace()->create();
+    $this->actingAs($this->user);
+    Filament::setTenant($this->user->currentWorkspace);
+});
+
+test('observer dispatches favicon job when company has domain and no existing logo', function (): void {
+    Bus::fake([FetchFaviconForCompany::class]);
+
+    $company = Company::factory()->for($this->user->currentWorkspace)->create();
+
+    $domainsField = CustomField::query()
+        ->where('code', CompanyField::DOMAINS->value)
+        ->forEntity(Company::class)
+        ->firstOrFail();
+
+    CustomFieldValue::forceCreate([
+        'tenant_id' => $this->user->currentWorkspace->getKey(),
+        'entity_type' => 'company',
+        'entity_id' => $company->getKey(),
+        'custom_field_id' => $domainsField->getKey(),
+        'json_value' => ['example.com'],
+    ]);
+
+    $company->touch();
+
+    Bus::assertDispatched(FetchFaviconForCompany::class);
+});
+
+test('observer does not dispatch favicon job when company already has a logo', function (): void {
+    $company = Company::factory()->for($this->user->currentWorkspace)->create();
+
+    $domainsField = CustomField::query()
+        ->where('code', CompanyField::DOMAINS->value)
+        ->forEntity(Company::class)
+        ->firstOrFail();
+
+    CustomFieldValue::forceCreate([
+        'tenant_id' => $this->user->currentWorkspace->getKey(),
+        'entity_type' => 'company',
+        'entity_id' => $company->getKey(),
+        'custom_field_id' => $domainsField->getKey(),
+        'json_value' => ['example.com'],
+    ]);
+
+    $company->addMediaFromString(onePixelPng())
+        ->usingFileName('logo.png')
+        ->toMediaCollection('logo');
+
+    Bus::fake([FetchFaviconForCompany::class]);
+    $company->touch();
+    Bus::assertNotDispatched(FetchFaviconForCompany::class);
+});
+
+test('observer does not dispatch when domain custom field is empty', function (): void {
+    Bus::fake([FetchFaviconForCompany::class]);
+
+    Company::factory()->for($this->user->currentWorkspace)->create();
+
+    Bus::assertNotDispatched(FetchFaviconForCompany::class);
+});
+
+test('observer dispatches favicon job when the domain no longer matches the stored logo', function (): void {
+    $company = Company::factory()->for($this->user->currentWorkspace)->create([
+        'custom_fields' => [CompanyField::DOMAINS->value => ['old-domain.com']],
+    ]);
+
+    $company->addMediaFromString(onePixelPng())
+        ->usingFileName('logo.png')
+        ->withCustomProperties(['domain' => 'https://old-domain.com'])
+        ->toMediaCollection('logo');
+
+    Bus::fake([FetchFaviconForCompany::class]);
+
+    $company->update(['custom_fields' => [CompanyField::DOMAINS->value => ['new-domain.com']]]);
+
+    Bus::assertDispatched(FetchFaviconForCompany::class);
+});
+
+test('observer does not dispatch favicon job when the stored logo matches the domain', function (): void {
+    $company = Company::factory()->for($this->user->currentWorkspace)->create([
+        'custom_fields' => [CompanyField::DOMAINS->value => ['example.com']],
+    ]);
+
+    $company->addMediaFromString(onePixelPng())
+        ->usingFileName('logo.png')
+        ->withCustomProperties(['domain' => 'https://example.com'])
+        ->toMediaCollection('logo');
+
+    Bus::fake([FetchFaviconForCompany::class]);
+
+    $company->update(['name' => 'Renamed']);
+
+    Bus::assertNotDispatched(FetchFaviconForCompany::class);
+});

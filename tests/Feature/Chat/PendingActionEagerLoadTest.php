@@ -1,0 +1,81 @@
+<?php
+
+declare(strict_types=1);
+
+use App\Models\User;
+use Filament\Facades\Filament;
+use Illuminate\Support\Facades\DB;
+use Relaticle\Chat\Models\PendingAction;
+use Relaticle\Chat\Queries\ConversationMessagesQuery;
+use Tests\Helpers\ChatDocument;
+
+mutates(ConversationMessagesQuery::class);
+
+beforeEach(function (): void {
+    $this->user = User::factory()->withPersonalWorkspace()->create();
+    $this->workspace = $this->user->currentWorkspace;
+    $this->actingAs($this->user);
+    Filament::setTenant($this->workspace);
+
+    DB::table('agent_conversations')->insert([
+        'id' => 'c-perf',
+        'participant_type' => 'user',
+        'participant_id' => $this->user->getKey(),
+        'workspace_id' => $this->workspace->getKey(),
+        'title' => 'Perf',
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    foreach (range(1, 10) as $i) {
+        DB::table('agent_conversation_messages')->insert([
+            'id' => "m-{$i}",
+            'conversation_id' => 'c-perf',
+            'participant_type' => 'user',
+            'participant_id' => $this->user->getKey(),
+            'agent' => 'Relaticle\\Chat\\Agents\\CrmAssistant',
+            'role' => 'assistant',
+            'content' => "message {$i}",
+            'document' => ChatDocument::emptyJson(),
+            'attachments' => '[]',
+            'steps' => storedToolSteps([[
+                'result' => json_encode([
+                    'type' => 'pending_action',
+                    'pending_action_id' => "pa-{$i}",
+                ]),
+            ]]),
+            'usage' => '{}',
+            'meta' => '{}',
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        PendingAction::query()->create([
+            'id' => "pa-{$i}",
+            'workspace_id' => $this->workspace->getKey(),
+            'user_id' => $this->user->getKey(),
+            'conversation_id' => 'c-perf',
+            'message_id' => "m-{$i}",
+            'action_class' => 'App\\Actions\\Company\\CreateCompany',
+            'operation' => 'create',
+            'entity_type' => 'company',
+            'action_data' => [],
+            'display_data' => [],
+            'status' => 'pending',
+            'expires_at' => now()->addMinutes(15),
+        ]);
+    }
+});
+
+it('fetches pending_actions in a single batch', function (): void {
+    DB::enableQueryLog();
+
+    resolve(ConversationMessagesQuery::class)->get($this->user, 'c-perf');
+
+    $queries = collect(DB::getQueryLog())
+        ->filter(fn (array $q): bool => str_contains($q['query'], 'pending_actions'));
+
+    expect($queries)->toHaveCount(1);
+
+    DB::disableQueryLog();
+});

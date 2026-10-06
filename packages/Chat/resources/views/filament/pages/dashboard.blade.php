@@ -1,0 +1,129 @@
+<x-filament-panels::page>
+    <div
+        x-data="dashboardChatInput(@js(\App\Filament\Pages\ChatConversation::getUrl()), @js(auth()->user()?->ai_preferences['default_model'] ?? 'auto'))"
+        class="mx-auto w-full max-w-3xl py-16"
+    >
+        <div class="text-center">
+            <h1 class="font-display text-3xl font-semibold tracking-tight text-gray-950 dark:text-white">
+                {{ $this->getGreeting() }}
+            </h1>
+
+            @if($recentChatId)
+                <a
+                    href="{{ \App\Filament\Pages\ChatConversation::getUrl(['conversationId' => $recentChatId]) }}"
+                    class="mt-2 inline-flex items-center gap-1.5 rounded-md text-sm text-gray-500 transition hover:text-gray-900 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary-500 dark:text-gray-400 dark:hover:text-white"
+                >
+                    <x-heroicon-o-chat-bubble-left class="h-3.5 w-3.5" />
+                    <span>{{ __('Recent chat') }} &middot; {{ \Illuminate\Support\Str::limit($recentChatTitle ?? __('Untitled chat'), 50) }}</span>
+                </a>
+            @endif
+        </div>
+
+        {{-- Chat input --}}
+        <form @submit.prevent="submit()" class="mt-10">
+            <div
+                x-data="chatEditor({
+                    placeholder: @js(__('Ask anything...')),
+                    autofocus: true,
+                    onSubmit: () => $root.dispatchEvent(new CustomEvent('dashboard:editor-submit', { bubbles: true })),
+                    mentionTexts: {
+                        listLabel: @js(__('Mention suggestions')),
+                        searching: @js(__('Searching…')),
+                        loadFailed: @js(__("Couldn't load suggestions.")),
+                        noMatches: @js(__('No matches for ":query".')),
+                        typeLabels: @js([
+                            'company' => __('Company'),
+                            'people' => __('Person'),
+                            'opportunity' => __('Opportunity'),
+                            'task' => __('Task'),
+                            'note' => __('Note'),
+                        ]),
+                    },
+                })"
+                x-on:dashboard:editor-submit.window="submit()"
+                x-on:chat:attachment-changed.window="if ($event.detail?.context === 'dashboard') pendingAttachment = $event.detail.attachment"
+                data-chat-context="dashboard"
+            >
+                @include('chat::livewire.chat.partials._composer-bar', [
+                    'context' => 'dashboard',
+                    'showStopButton' => false,
+                    'sendDisabled' => '(text.trim().length === 0 && !pendingAttachment) || text.length > 5000 || submitting',
+                ])
+            </div>
+
+            <div
+                x-show="error"
+                x-cloak
+                role="alert"
+                class="mt-2 text-xs text-red-600 dark:text-red-400"
+                x-text="error"
+            ></div>
+
+        </form>
+
+        {{ \Filament\Support\Facades\FilamentView::renderHook(\App\Filament\Pages\Dashboard::AFTER_COMPOSER_RENDER_HOOK) }}
+
+        @include('chat::filament.pages.partials.my-tasks')
+    </div>
+
+    @script
+    <script>
+        Alpine.data('dashboardChatInput', (chatUrl, defaultModel) => ({
+            submitting: false,
+            error: null,
+            pendingAttachment: null,
+            @include('chat::livewire.chat.partials._model-state')
+
+            init() {
+                const candidate = defaultModel || 'auto';
+                this.selectedModel = this.allowedModels.includes(candidate)
+                    && this.modelOptions.some((o) => o.value === candidate)
+                    ? candidate
+                    : 'auto';
+            },
+
+            // Scoped lookup of the dashboard's TipTap editor, avoiding the
+            // window.__dashboardEditor global which collides if any sibling
+            // chat-interface instance also writes its own global. We use
+            // document.querySelector keyed by data-chat-context to dodge the
+            // same Livewire-morph stale-root problem documented on the
+            // chatInterface.localEditor() helper.
+            localEditor() {
+                const wrapper = document.querySelector('[data-chat-context="dashboard"][x-data*="chatEditor"]');
+                if (! wrapper || ! window.Alpine) return null;
+                return window.Alpine.$data(wrapper);
+            },
+
+            submit() {
+                const editor = this.localEditor();
+                if (!editor || (editor.getText().trim().length === 0 && !this.pendingAttachment) || this.submitting) return;
+
+                this.submitting = true;
+                this.error = null;
+
+                // Hand the editor document to the conversation page via sessionStorage
+                // and navigate immediately. The conversation page picks up the bootstrap
+                // payload in chatInterface.init(), restores the editor (preserving
+                // mentions), and fires the first-message POST from there. This avoids
+                // a long wait on the dashboard when the queue is slow or running sync.
+                try {
+                    sessionStorage.setItem('chat:bootstrap', JSON.stringify({
+                        document: editor.getDocument(),
+                        model: this.selectedModel,
+                        attachment: this.pendingAttachment,
+                    }));
+                } catch (_) {
+                    this.error = @js(__('Could not save message. Try again.'));
+                    this.submitting = false;
+                    return;
+                }
+
+                // SPA navigation, mirroring openSwitcherItem in transcript.js:
+                // a full reload here repainted the whole Filament shell on
+                // every first message.
+                window.Alpine?.navigate ? window.Alpine.navigate(chatUrl) : (window.location.href = chatUrl);
+            },
+        }));
+    </script>
+    @endscript
+</x-filament-panels::page>

@@ -1,0 +1,83 @@
+<?php
+
+declare(strict_types=1);
+
+namespace App\Mcp\Prompts;
+
+use App\Models\Company;
+use App\Models\Note;
+use App\Models\Opportunity;
+use App\Models\People;
+use App\Models\PersonalAccessToken;
+use App\Models\Task;
+use App\Models\User;
+use Illuminate\Support\Facades\Cache;
+use Laravel\Mcp\Request;
+use Laravel\Mcp\Response;
+use Laravel\Mcp\Server\Attributes\Description;
+use Laravel\Mcp\Server\Prompt;
+
+#[Description('Get an overview of the CRM data for the current workspace, including record counts and recent activity.')]
+final class CrmOverviewPrompt extends Prompt
+{
+    private const int CACHE_TTL = 60;
+
+    public function shouldRegister(): bool
+    {
+        $token = auth()->user()?->currentAccessToken();
+        if (! $token instanceof PersonalAccessToken) {
+            return true;
+        }
+        if (! $token->getKey()) {
+            return true;
+        }
+
+        return $token->can('read');
+    }
+
+    public function handle(Request $request): Response
+    {
+        /** @var User $user */
+        $user = $request->user();
+        $workspaceId = $user->currentWorkspace->getKey();
+        $cacheKey = "crm_overview_{$workspaceId}";
+
+        $overview = Cache::remember($cacheKey, self::CACHE_TTL, function () use ($workspaceId): string {
+            $counts = [
+                'companies' => Company::query()->where('workspace_id', $workspaceId)->count(),
+                'people' => People::query()->where('workspace_id', $workspaceId)->count(),
+                'opportunities' => Opportunity::query()->where('workspace_id', $workspaceId)->count(),
+                'tasks' => Task::query()->where('workspace_id', $workspaceId)->count(),
+                'notes' => Note::query()->where('workspace_id', $workspaceId)->count(),
+            ];
+
+            $recentCompanies = Company::query()
+                ->where('workspace_id', $workspaceId)
+                ->latest()
+                ->take(5)
+                ->pluck('name')
+                ->implode(', ');
+
+            $recentPeople = People::query()
+                ->where('workspace_id', $workspaceId)
+                ->latest()
+                ->take(5)
+                ->pluck('name')
+                ->implode(', ');
+
+            $text = "CRM Overview for current workspace:\n\n";
+            $text .= "Record Counts:\n";
+
+            foreach ($counts as $entity => $count) {
+                $text .= "  - {$entity}: {$count}\n";
+            }
+
+            $text .= "\nRecent Companies: {$recentCompanies}\n";
+            $text .= "Recent People: {$recentPeople}\n";
+
+            return $text."\nUse the available tools to search, create, update, or delete CRM records.";
+        });
+
+        return Response::text($overview);
+    }
+}

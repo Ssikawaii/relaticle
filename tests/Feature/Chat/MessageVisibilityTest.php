@@ -1,0 +1,56 @@
+<?php
+
+declare(strict_types=1);
+
+use App\Models\User;
+use Illuminate\Support\Facades\DB;
+use Relaticle\Chat\Queries\ConversationMessagesQuery;
+use Tests\Helpers\ChatDocument;
+
+mutates(ConversationMessagesQuery::class);
+
+it('hides synthetic user messages from the visible message list', function (): void {
+    $user = User::factory()->withPersonalWorkspace()->create();
+    $this->actingAs($user);
+
+    $convId = '019df800-2222-7000-8000-000000000001';
+    DB::table('agent_conversations')->insert([
+        'id' => $convId,
+        'participant_type' => 'user',
+        'participant_id' => (string) $user->getKey(),
+        'workspace_id' => $user->currentWorkspace->getKey(),
+        'title' => '',
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    $base = [
+        'conversation_id' => $convId,
+        'participant_type' => 'user',
+        'participant_id' => (string) $user->getKey(),
+        'agent' => 'crm',
+        'document' => ChatDocument::emptyJson(),
+        'attachments' => '[]',
+        'steps' => '[]',
+        'usage' => '{}',
+        'meta' => '{}',
+        'origin' => 'typed',
+    ];
+
+    DB::table('agent_conversation_messages')->insert([
+        ['id' => '019df800-2222-7000-8000-000000000010', 'role' => 'user', 'content' => 'Create task for Angel', 'created_at' => now()->subSeconds(30), 'updated_at' => now()->subSeconds(30)] + $base,
+        ['id' => '019df800-2222-7000-8000-000000000011', 'role' => 'assistant', 'content' => 'I have proposed creating a person.', 'created_at' => now()->subSeconds(20), 'updated_at' => now()->subSeconds(20)] + $base,
+        ['id' => '019df800-2222-7000-8000-000000000012', 'role' => 'user', 'content' => "[approval]\nstatus: approved\nentity_type: people\nrecord_id: 01abc\n", 'origin' => 'resume', 'created_at' => now()->subSeconds(10), 'updated_at' => now()->subSeconds(10)] + $base,
+        ['id' => '019df800-2222-7000-8000-000000000013', 'role' => 'assistant', 'content' => 'Now proposing the linked task.', 'created_at' => now(), 'updated_at' => now()] + $base,
+    ]);
+
+    $messages = resolve(ConversationMessagesQuery::class)->get($user, $convId);
+
+    $contents = collect($messages)->pluck('content')->all();
+
+    expect($contents)->toContain('Create task for Angel');
+    expect(implode("\n", $contents))->toContain('I have proposed creating a person.');
+    expect(implode("\n", $contents))->toContain('Now proposing the linked task.');
+
+    expect(array_column($messages, 'id'))->not->toContain('019df800-2222-7000-8000-000000000012');
+});

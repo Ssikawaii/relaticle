@@ -1,0 +1,103 @@
+<?php
+
+declare(strict_types=1);
+
+use Rector\CodingStyle\Rector\ArrowFunction\ArrowFunctionDelegatingCallToFirstClassCallableRector;
+use Rector\Config\RectorConfig;
+use Rector\DeadCode\Rector\ClassMethod\RemoveUnusedPrivateMethodRector;
+use Rector\Php81\Rector\Array_\ArrayToFirstClassCallableRector;
+use Rector\Php83\Rector\ClassMethod\AddOverrideAttributeToOverriddenMethodsRector;
+use Rector\Php85\Rector\Property\AddOverrideAttributeToOverriddenPropertiesRector;
+use Rector\Privatization\Rector\ClassMethod\PrivatizeFinalClassMethodRector;
+use RectorLaravel\Rector\Class_\AddHasFactoryToModelsRector;
+use RectorLaravel\Rector\Class_\UseForwardsCallsTraitRector;
+use RectorLaravel\Rector\ClassMethod\AddGenericBuilderToScopesRector;
+use RectorLaravel\Rector\Coalesce\ApplyDefaultInsteadOfNullCoalesceRector;
+use RectorLaravel\Rector\Empty_\EmptyToBlankAndFilledFuncRector;
+use RectorLaravel\Rector\StaticCall\CarbonToDateFacadeRector;
+use RectorLaravel\Set\LaravelSetList;
+
+return RectorConfig::configure()
+    ->withComposerBased(laravel: true)
+    // Keep the result cache inside the project so CI can restore it between runs.
+    // Rector otherwise caches to the system temp dir, which GitHub Actions discards.
+    ->withCache(cacheDirectory: __DIR__.'/.cache/rector')
+    ->withPaths([
+        __DIR__.'/app',
+        __DIR__.'/packages',
+        __DIR__.'/bootstrap/app.php',
+        __DIR__.'/config',
+        __DIR__.'/database',
+        __DIR__.'/public',
+    ])
+    ->withSkip([
+        AddOverrideAttributeToOverriddenMethodsRector::class,
+        // PHP 8.5 extends #[\Override] to properties. Skipped for the same reason as
+        // the method rule above: it would tag every Filament $navigationIcon/$slug
+        // override in the codebase without adding safety we rely on.
+        AddOverrideAttributeToOverriddenPropertiesRector::class,
+        // Rewrites imported `Builder<Model>` scope docblocks to fully qualified
+        // `Builder<self>`, which regresses the docblock import rule for no type gain.
+        AddGenericBuilderToScopesRector::class,
+        RemoveUnusedPrivateMethodRector::class => [
+            // Skip Filament importer lifecycle hooks - they're called dynamically via callHook()
+            __DIR__.'/app/Filament/Imports/*',
+        ],
+        PrivatizeFinalClassMethodRector::class => [
+            // Filament runs lifecycle hooks through callHook() in BasePage scope,
+            // so a private hook on a final page is a fatal error at runtime.
+            __DIR__.'/app/Filament/Imports/*',
+            __DIR__.'/app/Filament/Pages/*',
+            __DIR__.'/packages/EmailIntegration/src/Filament/Pages/*',
+        ],
+        ArrayToFirstClassCallableRector::class => [
+            // class_exists has optional bool param that conflicts with Collection::first signature
+            __DIR__.'/app/Providers/AppServiceProvider.php',
+        ],
+        ArrowFunctionDelegatingCallToFirstClassCallableRector::class => [
+            // class_exists has optional bool param that conflicts with Collection::first signature
+            __DIR__.'/app/Providers/AppServiceProvider.php',
+        ],
+        // spatie/laravel-settings ships `repositories.database.table` as null, so the
+        // key EXISTS and config()'s default argument is never reached. Rewriting the
+        // `??` to that default hands the migration null and it runs `create table ""`.
+        ApplyDefaultInsteadOfNullCoalesceRector::class => [
+            __DIR__.'/database/migrations/2026_08_27_120000_create_settings_table.php',
+        ],
+        AddHasFactoryToModelsRector::class => [
+            __DIR__.'/app/Models/PersonalAccessToken.php',
+            __DIR__.'/app/Models/ActivityLog/Activity.php',
+            __DIR__.'/app/Models/Passport/*',
+            __DIR__.'/app/Models/Pivots/*',
+            __DIR__.'/packages/ImportWizard/src/Models/*',
+        ],
+    ])
+    ->withSets([
+        LaravelSetList::LARAVEL_ARRAYACCESS_TO_METHOD_CALL,
+        LaravelSetList::LARAVEL_ARRAY_STR_FUNCTION_TO_STATIC_CALL,
+        LaravelSetList::LARAVEL_CODE_QUALITY,
+        LaravelSetList::LARAVEL_COLLECTION,
+        LaravelSetList::LARAVEL_CONTAINER_STRING_TO_FULLY_QUALIFIED_NAME,
+        LaravelSetList::LARAVEL_ELOQUENT_MAGIC_METHOD_TO_QUERY_BUILDER,
+        LaravelSetList::LARAVEL_FACADE_ALIASES_TO_FULL_NAMES,
+        LaravelSetList::LARAVEL_FACTORIES,
+        LaravelSetList::LARAVEL_IF_HELPERS,
+        LaravelSetList::LARAVEL_TESTING,
+        LaravelSetList::LARAVEL_TYPE_DECLARATIONS,
+    ])
+    ->withRules([
+        // Dates are immutable application-wide via Date::use(CarbonImmutable::class).
+        // A hardcoded Carbon:: static call bypasses that factory and hands back a
+        // mutable date the type hints no longer accept.
+        CarbonToDateFacadeRector::class,
+        EmptyToBlankAndFilledFuncRector::class,
+        UseForwardsCallsTraitRector::class,
+    ])
+    ->withPreparedSets(
+        deadCode: true,
+        codeQuality: true,
+        typeDeclarations: true,
+        privatization: true,
+        earlyReturn: true,
+    )
+    ->withPhpSets();

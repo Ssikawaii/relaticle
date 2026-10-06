@@ -1,0 +1,13 @@
+{
+    "scripts": {
+        "setup": [
+            "bin/setup-workspace.sh"
+        ],
+        "archive": [
+            "bin/archive-workspace.sh"
+        ]
+    },
+    "preview": {
+        "url": "https://{{folder}}.test"
+    }
+}

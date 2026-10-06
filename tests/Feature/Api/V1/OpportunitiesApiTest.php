@@ -1,0 +1,1027 @@
+<?php
+
+declare(strict_types=1);
+
+use App\Actions\CustomFields\CreateCustomField;
+use App\Actions\Opportunity\CreateOpportunity;
+use App\Actions\Opportunity\DeleteOpportunity;
+use App\Actions\Opportunity\UpdateOpportunity;
+use App\Enums\CreationSource;
+use App\Http\Controllers\Api\V1\OpportunitiesController;
+use App\Http\Resources\V1\OpportunityResource;
+use App\Models\Company;
+use App\Models\CustomField;
+use App\Models\CustomFieldSection;
+use App\Models\Opportunity;
+use App\Models\People;
+use App\Models\User;
+use App\Models\Workspace;
+use App\Queries\Concerns\ListsEntity;
+use App\Queries\Opportunities\OpportunitiesQuery;
+use Illuminate\Support\Str;
+use Illuminate\Testing\Fluent\AssertableJson;
+use Laravel\Sanctum\Sanctum;
+use Tests\Helpers\WorkspaceCustomField;
+
+mutates(
+    OpportunitiesController::class,
+    CreateOpportunity::class,
+    UpdateOpportunity::class,
+    DeleteOpportunity::class,
+    OpportunitiesQuery::class,
+    ListsEntity::class,
+    OpportunityResource::class,
+);
+
+beforeEach(function () {
+    $this->user = User::factory()->withPersonalWorkspace()->create();
+    $this->workspace = $this->user->personalWorkspace();
+});
+
+function customFieldForOpportunities(Workspace $workspace, string $code, string $name, string $type): CustomField
+{
+    $section = CustomFieldSection::create([
+        'tenant_id' => $workspace->id,
+        'entity_type' => 'opportunity',
+        'name' => $name,
+        'code' => "{$code}_section",
+        'type' => 'section',
+        'sort_order' => 99,
+        'active' => true,
+    ]);
+
+    return CustomField::create([
+        'tenant_id' => $workspace->id,
+        'custom_field_section_id' => $section->id,
+        'entity_type' => 'opportunity',
+        'code' => $code,
+        'name' => $name,
+        'type' => $type,
+        'sort_order' => 99,
+        'active' => true,
+        'validation_rules' => [],
+    ]);
+}
+
+it('requires authentication', function (): void {
+    $this->getJson('/api/v1/opportunities')->assertUnauthorized();
+});
+
+it('can list opportunities', function (): void {
+    Sanctum::actingAs($this->user);
+
+    $seeded = Opportunity::query()->where('workspace_id', $this->workspace->id)->count();
+    Opportunity::factory(3)->recycle([$this->user, $this->workspace])->create();
+
+    $this->getJson('/api/v1/opportunities')
+        ->assertOk()
+        ->assertJsonCount($seeded + 3, 'data')
+        ->assertJsonStructure(['data' => [['id', 'type', 'attributes']]]);
+});
+
+it('can create an opportunity', function (): void {
+    Sanctum::actingAs($this->user);
+
+    $this->postJson('/api/v1/opportunities', ['name' => 'Big Deal'])
+        ->assertCreated()
+        ->assertValid()
+        ->assertJson(fn (AssertableJson $json) => $json
+            ->has('data', fn (AssertableJson $json) => $json
+                ->whereType('id', 'string')
+                ->where('type', 'opportunities')
+                ->has('attributes', fn (AssertableJson $json) => $json
+                    ->where('name', 'Big Deal')
+                    ->where('creation_source', CreationSource::API->value)
+                    ->whereType('created_at', 'string')
+                    ->whereType('custom_fields', 'array')
+                    ->missing('workspace_id')
+                    ->missing('creator_id')
+                    ->etc()
+                )
+                ->etc()
+            )
+        );
+
+    $this->assertDatabaseHas('opportunities', ['name' => 'Big Deal', 'workspace_id' => $this->workspace->id]);
+});
+
+it('validates required fields on create', function (): void {
+    Sanctum::actingAs($this->user);
+
+    $this->postJson('/api/v1/opportunities', [])
+        ->assertUnprocessable()
+        ->assertInvalid(['name']);
+});
+
+it('can show an opportunity', function (): void {
+    Sanctum::actingAs($this->user);
+
+    $opportunity = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Show Test']);
+
+    $this->getJson("/api/v1/opportunities/{$opportunity->id}")
+        ->assertOk()
+        ->assertJson(fn (AssertableJson $json) => $json
+            ->has('data', fn (AssertableJson $json) => $json
+                ->where('id', $opportunity->id)
+                ->where('type', 'opportunities')
+                ->has('attributes', fn (AssertableJson $json) => $json
+                    ->where('name', 'Show Test')
+                    ->whereType('creation_source', 'string')
+                    ->whereType('custom_fields', 'array')
+                    ->missing('workspace_id')
+                    ->missing('creator_id')
+                    ->etc()
+                )
+                ->etc()
+            )
+        );
+});
+
+it('does not expose MCP-only task relationships through the public API', function (): void {
+    Sanctum::actingAs($this->user);
+
+    $opportunity = Opportunity::factory()->recycle([$this->user, $this->workspace])->create();
+
+    $this->getJson("/api/v1/opportunities/{$opportunity->id}?include=tasks")
+        ->assertOk()
+        ->assertJsonMissingPath('data.relationships.tasks')
+        ->assertJsonMissingPath('included');
+});
+
+it('can update an opportunity', function (): void {
+    Sanctum::actingAs($this->user);
+
+    $opportunity = Opportunity::factory()->recycle([$this->user, $this->workspace])->create();
+
+    $this->putJson("/api/v1/opportunities/{$opportunity->id}", ['name' => 'Updated Name'])
+        ->assertOk()
+        ->assertValid()
+        ->assertJson(fn (AssertableJson $json) => $json
+            ->has('data', fn (AssertableJson $json) => $json
+                ->where('id', $opportunity->id)
+                ->where('type', 'opportunities')
+                ->has('attributes', fn (AssertableJson $json) => $json
+                    ->where('name', 'Updated Name')
+                    ->etc()
+                )
+                ->etc()
+            )
+        );
+});
+
+it('can delete an opportunity', function (): void {
+    Sanctum::actingAs($this->user);
+
+    $opportunity = Opportunity::factory()->recycle([$this->user, $this->workspace])->create();
+
+    $this->deleteJson("/api/v1/opportunities/{$opportunity->id}")
+        ->assertNoContent();
+
+    $this->assertSoftDeleted('opportunities', ['id' => $opportunity->id]);
+});
+
+it('scopes opportunities to current workspace', function (): void {
+    $otherOpportunity = Opportunity::withoutEvents(fn () => Opportunity::factory()->create(['workspace_id' => Workspace::factory()->create()->id]));
+
+    Sanctum::actingAs($this->user);
+
+    $ownOpportunity = Opportunity::factory()->recycle([$this->user, $this->workspace])->create();
+
+    $response = $this->getJson('/api/v1/opportunities');
+
+    $response->assertOk();
+
+    $ids = collect($response->json('data'))->pluck('id');
+    expect($ids)->toContain($ownOpportunity->id);
+    expect($ids)->not->toContain($otherOpportunity->id);
+});
+
+describe('cross-tenant isolation', function (): void {
+    it('cannot show an opportunity from another workspace', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $otherWorkspace = Workspace::factory()->create();
+        $otherOpportunity = Opportunity::withoutEvents(fn () => Opportunity::factory()->create(['workspace_id' => $otherWorkspace->id]));
+
+        $this->getJson("/api/v1/opportunities/{$otherOpportunity->id}")
+            ->assertNotFound();
+    });
+
+    it('cannot update an opportunity from another workspace', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $otherWorkspace = Workspace::factory()->create();
+        $otherOpportunity = Opportunity::withoutEvents(fn () => Opportunity::factory()->create(['workspace_id' => $otherWorkspace->id]));
+
+        $this->putJson("/api/v1/opportunities/{$otherOpportunity->id}", ['name' => 'Hacked'])
+            ->assertNotFound();
+    });
+
+    it('cannot delete an opportunity from another workspace', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $otherWorkspace = Workspace::factory()->create();
+        $otherOpportunity = Opportunity::withoutEvents(fn () => Opportunity::factory()->create(['workspace_id' => $otherWorkspace->id]));
+
+        $this->deleteJson("/api/v1/opportunities/{$otherOpportunity->id}")
+            ->assertNotFound();
+    });
+
+    it('rejects company_id from another workspace on create', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $otherWorkspace = Workspace::factory()->create();
+        $otherCompany = Company::withoutEvents(fn () => Company::factory()->create([
+            'workspace_id' => $otherWorkspace->id,
+        ]));
+
+        $this->postJson('/api/v1/opportunities', [
+            'name' => 'Test Deal',
+            'company_id' => $otherCompany->id,
+        ])
+            ->assertUnprocessable()
+            ->assertInvalid(['company_id']);
+    });
+
+    it('rejects contact_id from another workspace on create', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $otherWorkspace = Workspace::factory()->create();
+        $otherPerson = People::withoutEvents(fn () => People::factory()->create([
+            'workspace_id' => $otherWorkspace->id,
+        ]));
+
+        $this->postJson('/api/v1/opportunities', [
+            'name' => 'Test Deal',
+            'contact_id' => $otherPerson->id,
+        ])
+            ->assertUnprocessable()
+            ->assertInvalid(['contact_id']);
+    });
+});
+
+describe('includes', function (): void {
+    it('can include creator on show endpoint', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $opportunity = Opportunity::factory()->recycle([$this->user, $this->workspace])->create();
+
+        $this->getJson("/api/v1/opportunities/{$opportunity->id}?include=creator")
+            ->assertOk()
+            ->assertJson(fn (AssertableJson $json) => $json
+                ->has('data.relationships.creator.data', fn (AssertableJson $json) => $json
+                    ->whereType('id', 'string')
+                    ->where('type', 'users')
+                )
+                ->has('included.0', fn (AssertableJson $json) => $json
+                    ->whereType('id', 'string')
+                    ->where('type', 'users')
+                    ->has('attributes')
+                    ->etc()
+                )
+                ->etc()
+            );
+    });
+
+    it('can include creator on list endpoint', function (): void {
+        Sanctum::actingAs($this->user);
+
+        Opportunity::factory()->recycle([$this->user, $this->workspace])->create();
+
+        $this->getJson('/api/v1/opportunities?include=creator')
+            ->assertOk()
+            ->assertJson(fn (AssertableJson $json) => $json
+                ->has('data.0.relationships.creator')
+                ->has('included')
+                ->etc()
+            );
+    });
+
+    it('can include company on show endpoint', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $company = Company::factory()->recycle([$this->user, $this->workspace])->create();
+        $opportunity = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['company_id' => $company->id]);
+
+        $this->getJson("/api/v1/opportunities/{$opportunity->id}?include=company")
+            ->assertOk()
+            ->assertJson(fn (AssertableJson $json) => $json
+                ->has('data.relationships.company.data', fn (AssertableJson $json) => $json
+                    ->whereType('id', 'string')
+                    ->where('type', 'companies')
+                )
+                ->has('included.0', fn (AssertableJson $json) => $json
+                    ->whereType('id', 'string')
+                    ->where('type', 'companies')
+                    ->has('attributes')
+                    ->etc()
+                )
+                ->etc()
+            );
+    });
+
+    it('can include contact on show endpoint', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $person = People::factory()->recycle([$this->user, $this->workspace])->create();
+        $opportunity = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['contact_id' => $person->id]);
+
+        $this->getJson("/api/v1/opportunities/{$opportunity->id}?include=contact")
+            ->assertOk()
+            ->assertJson(fn (AssertableJson $json) => $json
+                ->has('data.relationships.contact.data', fn (AssertableJson $json) => $json
+                    ->whereType('id', 'string')
+                    ->where('type', 'people')
+                )
+                ->has('included.0', fn (AssertableJson $json) => $json
+                    ->whereType('id', 'string')
+                    ->where('type', 'people')
+                    ->has('attributes')
+                    ->etc()
+                )
+                ->etc()
+            );
+    });
+
+    it('can include multiple relations', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $company = Company::factory()->recycle([$this->user, $this->workspace])->create();
+        $opportunity = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['company_id' => $company->id]);
+
+        $this->getJson("/api/v1/opportunities/{$opportunity->id}?include=creator,company")
+            ->assertOk()
+            ->assertJson(fn (AssertableJson $json) => $json
+                ->has('data.relationships.creator')
+                ->has('data.relationships.company')
+                ->etc()
+            );
+    });
+
+    it('does not include relations when not requested', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $opportunity = Opportunity::factory()->recycle([$this->user, $this->workspace])->create();
+
+        $response = $this->getJson("/api/v1/opportunities/{$opportunity->id}")
+            ->assertOk();
+
+        expect($response->json('data.relationships'))->toBeNull();
+    });
+
+    it('can include relationship counts', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $opportunity = Opportunity::factory()->recycle([$this->user, $this->workspace])->create();
+
+        $response = $this->getJson('/api/v1/opportunities?include=tasksCount');
+
+        $response->assertOk();
+
+        $oppData = collect($response->json('data'))
+            ->firstWhere('id', $opportunity->id);
+        expect($oppData['attributes']['tasks_count'])->toBe(0);
+    });
+
+    it('rejects disallowed includes on list endpoint', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $this->getJson('/api/v1/opportunities?include=secret')
+            ->assertStatus(400);
+    });
+});
+
+describe('filtering and sorting', function (): void {
+    it('can filter opportunities by name', function (): void {
+        Sanctum::actingAs($this->user);
+
+        Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Enterprise Deal']);
+        Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Small Contract']);
+
+        $response = $this->getJson('/api/v1/opportunities?filter[name][$contains]=Enterprise');
+
+        $response->assertOk();
+
+        $names = collect($response->json('data'))->pluck('attributes.name');
+        expect($names)->toContain('Enterprise Deal');
+        expect($names)->not->toContain('Small Contract');
+    });
+
+    it('can filter opportunities by company', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $company = Company::factory()->recycle([$this->user, $this->workspace])->create();
+        $matched = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['company_id' => $company->id]);
+        $unmatched = Opportunity::factory()->recycle([$this->user, $this->workspace])->create();
+
+        $response = $this->getJson('/api/v1/opportunities?filter[company][$in]='.$company->id);
+
+        $response->assertOk();
+
+        $ids = collect($response->json('data'))->pluck('id');
+        expect($ids)->toContain($matched->id);
+        expect($ids)->not->toContain($unmatched->id);
+    });
+
+    it('filters a custom field with a $-prefixed operator', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $stage = WorkspaceCustomField::byCode($this->workspace->id, 'opportunity', 'stage');
+        $won = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Won Deal']);
+        $open = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Open Deal']);
+        $won->saveCustomFieldValue($stage, (string) $stage->options->firstWhere('name', 'Closed Won')->getKey());
+
+        $ids = collect($this->getJson('/api/v1/opportunities?filter[custom_fields][stage][$eq]=Closed%20Won')->assertOk()->json('data'))->pluck('id');
+
+        expect($ids)->toContain($won->id)->not->toContain($open->id);
+    });
+
+    it('names the $ form when an operator has no sigil', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $this->getJson('/api/v1/opportunities?filter[custom_fields][stage][eq]=Closed%20Won')
+            ->assertUnprocessable()
+            ->assertJsonFragment(['Operators start with $. Use $eq.']);
+    });
+
+    it('compares the text true without turning it into a boolean', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $motto = customFieldForOpportunities($this->workspace, 'motto', 'Motto', 'text');
+        $match = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Match Deal']);
+        $other = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Other Deal']);
+        $match->saveCustomFieldValue($motto, 'true');
+        $other->saveCustomFieldValue($motto, 'false');
+
+        $ids = collect($this->getJson('/api/v1/opportunities?filter[custom_fields][motto][$eq]=true')->assertOk()->json('data'))->pluck('id');
+
+        expect($ids->all())->toBe([$match->id]);
+    });
+
+    it('matches a tag literally named true sent as a query string list item', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $labels = resolve(CreateCustomField::class)->execute($this->user, [
+            'entity_type' => 'opportunity',
+            'name' => 'Labels',
+            'code' => 'labels',
+            'type' => 'tags-input',
+        ]);
+        $tagged = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Tagged Deal']);
+        $plain = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Plain Deal']);
+        $tagged->saveCustomFieldValue($labels, ['true']);
+        $plain->saveCustomFieldValue($labels, ['other']);
+
+        $ids = collect($this->getJson('/api/v1/opportunities?filter[custom_fields][labels][$has_any][]=true')->assertOk()->json('data'))->pluck('id');
+
+        expect($ids->all())->toBe([$tagged->id]);
+    });
+
+    it('reads is_empty from a query string boolean', function (string $raw, string $shown, string $hidden): void {
+        Sanctum::actingAs($this->user);
+
+        $stage = WorkspaceCustomField::byCode($this->workspace->id, 'opportunity', 'stage');
+        $staged = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Staged Deal']);
+        $unstaged = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Unstaged Deal']);
+        $staged->saveCustomFieldValue($stage, (string) $stage->options->firstWhere('name', 'Qualification')->getKey());
+
+        $ids = collect($this->getJson('/api/v1/opportunities?filter[custom_fields][stage][$is_empty]='.$raw)->assertOk()->json('data'))->pluck('id');
+        $deals = ['staged' => $staged->id, 'unstaged' => $unstaged->id];
+
+        expect($ids)->toContain($deals[$shown])->not->toContain($deals[$hidden]);
+    })->with([
+        'one' => ['1', 'unstaged', 'staged'],
+        'true' => ['true', 'unstaged', 'staged'],
+        'zero' => ['0', 'staged', 'unstaged'],
+        'false' => ['false', 'staged', 'unstaged'],
+    ]);
+
+    it('rejects an empty exclusion list sent as a query string', function (string $query): void {
+        Sanctum::actingAs($this->user);
+
+        Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Some Deal']);
+
+        $this->getJson("/api/v1/opportunities?{$query}")
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors(['filter.custom_fields.stage.$not_in']);
+    })->with([
+        'empty array item' => ['filter[custom_fields][stage][$not_in][]='],
+        'empty value' => ['filter[custom_fields][stage][$not_in]='],
+    ]);
+
+    it('ignores an empty custom field filter parameter', function (string $query): void {
+        Sanctum::actingAs($this->user);
+
+        $deal = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Some Deal']);
+
+        $ids = collect($this->getJson("/api/v1/opportunities?{$query}")->assertOk()->json('data'))->pluck('id');
+
+        expect($ids)->toContain($deal->id);
+    })->with([
+        'empty value' => ['filter[custom_fields]='],
+        'bare key' => ['filter[custom_fields]'],
+        'blank value' => ['filter[custom_fields]=%20'],
+    ]);
+
+    it('can filter opportunities by a numeric custom field sent as a query string', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $amount = CustomField::query()->withoutGlobalScopes()
+            ->where('tenant_id', $this->workspace->id)
+            ->where('entity_type', 'opportunity')
+            ->where('code', 'amount')
+            ->firstOrFail();
+
+        $big = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Big Deal']);
+        $small = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Small Deal']);
+        $big->saveCustomFieldValue($amount, 100000);
+        $small->saveCustomFieldValue($amount, 5000);
+
+        $response = $this->getJson('/api/v1/opportunities?filter[custom_fields][amount][$gt]=50000')
+            ->assertOk();
+
+        $ids = collect($response->json('data'))->pluck('id');
+        expect($ids)->toContain($big->id)->not->toContain($small->id);
+    });
+
+    it('rejects a non-numeric operand for a numeric custom field', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $this->getJson('/api/v1/opportunities?filter[custom_fields][amount][$gt]=lots')
+            ->assertStatus(422)
+            ->assertJsonValidationErrors(['filter.custom_fields.amount.$gt']);
+    });
+
+    it('rejects a date operand that is not a calendar date', function (string $operand): void {
+        Sanctum::actingAs($this->user);
+
+        $this->getJson('/api/v1/opportunities?filter[custom_fields][close_date][$gt]='.urlencode($operand))
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors(['filter.custom_fields.close_date.$gt' => 'close_date $gt must be a date']);
+    })->with([
+        'not a date' => ['notadate'],
+        'month thirteen' => ['2026-13-45'],
+        'day that does not exist' => ['2026-02-30'],
+        'relative word' => ['tomorrow'],
+    ]);
+
+    it('matches a date field against the day of an iso date-time operand', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $closeDate = WorkspaceCustomField::byCode($this->workspace->id, 'opportunity', 'close_date');
+        $newYear = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'New Year Deal']);
+        $spring = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Spring Deal']);
+        $newYear->saveCustomFieldValue($closeDate, '2026-01-01');
+        $spring->saveCustomFieldValue($closeDate, '2026-04-01');
+
+        $ids = collect($this->getJson('/api/v1/opportunities?filter[custom_fields][close_date][$eq]='.urlencode('2026-01-01T15:00:00Z'))->assertOk()->json('data'))->pluck('id');
+
+        expect($ids)->toContain($newYear->id)->not->toContain($spring->id);
+    });
+
+    it('can filter opportunities by a single-value in operand sent as a query string', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $stage = CustomField::query()->withoutGlobalScopes()
+            ->where('tenant_id', $this->workspace->id)
+            ->where('entity_type', 'opportunity')
+            ->where('code', 'stage')
+            ->firstOrFail();
+
+        $matched = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Proposed Deal']);
+        $unmatched = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Prospected Deal']);
+        $matched->saveCustomFieldValue($stage, (string) $stage->options->firstWhere('name', 'Qualification')->getKey());
+        $unmatched->saveCustomFieldValue($stage, (string) $stage->options->firstWhere('name', 'Prospecting')->getKey());
+
+        $response = $this->getJson('/api/v1/opportunities?filter[custom_fields][stage][$in]=Qualification')
+            ->assertOk();
+
+        $ids = collect($response->json('data'))->pluck('id');
+        expect($ids)->toContain($matched->id)->not->toContain($unmatched->id);
+    });
+
+    it('can filter opportunities by a comma separated in operand sent as a query string', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $stage = CustomField::query()->withoutGlobalScopes()
+            ->where('tenant_id', $this->workspace->id)
+            ->where('entity_type', 'opportunity')
+            ->where('code', 'stage')
+            ->firstOrFail();
+
+        $proposal = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Proposed Deal']);
+        $prospecting = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Prospected Deal']);
+        $won = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Won Deal']);
+        $proposal->saveCustomFieldValue($stage, (string) $stage->options->firstWhere('name', 'Qualification')->getKey());
+        $prospecting->saveCustomFieldValue($stage, (string) $stage->options->firstWhere('name', 'Prospecting')->getKey());
+        $won->saveCustomFieldValue($stage, (string) $stage->options->firstWhere('name', 'Closed Won')->getKey());
+
+        $response = $this->getJson('/api/v1/opportunities?filter[custom_fields][stage][$in]=Qualification,Prospecting')
+            ->assertOk();
+
+        $ids = collect($response->json('data'))->pluck('id');
+        expect($ids)->toContain($proposal->id)->toContain($prospecting->id)->not->toContain($won->id);
+    });
+
+    it('accepts option ids separated by a comma and a space', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $stage = WorkspaceCustomField::byCode($this->workspace->id, 'opportunity', 'stage');
+        $qualificationId = (string) $stage->options->firstWhere('name', 'Qualification')->getKey();
+        $prospectingId = (string) $stage->options->firstWhere('name', 'Prospecting')->getKey();
+
+        $qualified = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Qualified Deal']);
+        $prospect = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Prospect Deal']);
+        $qualified->saveCustomFieldValue($stage, $qualificationId);
+        $prospect->saveCustomFieldValue($stage, $prospectingId);
+
+        $response = $this->getJson('/api/v1/opportunities?filter[custom_fields][stage][$in]='.urlencode("{$qualificationId}, {$prospectingId}"))
+            ->assertOk();
+
+        $ids = collect($response->json('data'))->pluck('id');
+        expect($ids)->toContain($qualified->id)->toContain($prospect->id);
+    });
+
+    it('rejects an unknown option label with a 422', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $this->getJson('/api/v1/opportunities?filter[custom_fields][stage][$eq]=Nope')
+            ->assertStatus(422)
+            ->assertJsonValidationErrors(['filter.custom_fields.stage.$eq']);
+    });
+
+    it('carries a label containing a comma through the array form', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $priority = resolve(CreateCustomField::class)->execute($this->user, [
+            'entity_type' => 'opportunity',
+            'name' => 'Priority',
+            'code' => 'deal_priority',
+            'type' => 'select',
+            'options' => ['Hot, urgent', 'Warm'],
+        ]);
+        $hot = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Hot Deal']);
+        $warm = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Warm Deal']);
+        $hot->saveCustomFieldValue($priority, (string) $priority->options()->where('name', 'Hot, urgent')->value('id'));
+        $warm->saveCustomFieldValue($priority, (string) $priority->options()->where('name', 'Warm')->value('id'));
+
+        $response = $this->getJson('/api/v1/opportunities?filter[custom_fields][deal_priority][$in][]='.urlencode('Hot, urgent'))
+            ->assertOk();
+
+        $ids = collect($response->json('data'))->pluck('id');
+        expect($ids)->toContain($hot->id)->not->toContain($warm->id);
+    });
+
+    it('keeps a free-text tag containing a comma whole when sent as a query string', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $labels = resolve(CreateCustomField::class)->execute($this->user, [
+            'entity_type' => 'opportunity',
+            'name' => 'Labels',
+            'code' => 'labels',
+            'type' => 'tags-input',
+        ]);
+        $urgent = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Urgent Deal']);
+        $calm = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Calm Deal']);
+        $urgent->saveCustomFieldValue($labels, ['Hot, urgent']);
+        $calm->saveCustomFieldValue($labels, ['urgent']);
+
+        $response = $this->getJson('/api/v1/opportunities?filter[custom_fields][labels][$has_any]='.urlencode('Hot, urgent'))
+            ->assertOk();
+
+        $ids = collect($response->json('data'))->pluck('id');
+        expect($ids)->toContain($urgent->id)->not->toContain($calm->id);
+    });
+
+    it('keeps a comma inside a contains operand sent as a query string', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $field = customFieldForOpportunities($this->workspace, 'legal_name', 'Legal Name', 'text');
+
+        $matched = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Matched']);
+        $unmatched = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Unmatched']);
+        $matched->saveCustomFieldValue($field, 'Acme, Inc.');
+        $unmatched->saveCustomFieldValue($field, 'Acme Holdings');
+
+        $response = $this->getJson('/api/v1/opportunities?filter[custom_fields][legal_name][$contains]='.urlencode('Acme, Inc'))
+            ->assertOk();
+
+        $ids = collect($response->json('data'))->pluck('id');
+        expect($ids)->toContain($matched->id)->not->toContain($unmatched->id);
+    });
+
+    it('can filter opportunities by a boolean custom field sent as a query string', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $field = customFieldForOpportunities($this->workspace, 'is_strategic', 'Is Strategic', 'toggle');
+
+        $strategic = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Strategic Deal']);
+        $ordinary = Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Ordinary Deal']);
+        $strategic->saveCustomFieldValue($field, true);
+        $ordinary->saveCustomFieldValue($field, false);
+
+        $response = $this->getJson('/api/v1/opportunities?filter[custom_fields][is_strategic][$eq]=1')
+            ->assertOk();
+
+        $ids = collect($response->json('data'))->pluck('id');
+        expect($ids)->toContain($strategic->id)->not->toContain($ordinary->id);
+    });
+
+    it('can sort opportunities by name ascending', function (): void {
+        Sanctum::actingAs($this->user);
+
+        Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Zulu Deal']);
+        Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Alpha Deal']);
+
+        $response = $this->getJson('/api/v1/opportunities?sort=name');
+
+        $response->assertOk();
+
+        $names = collect($response->json('data'))->pluck('attributes.name')->values();
+        $alphaIndex = $names->search('Alpha Deal');
+        $zuluIndex = $names->search('Zulu Deal');
+        expect($alphaIndex)->toBeLessThan($zuluIndex);
+    });
+
+    it('can sort opportunities by name descending', function (): void {
+        Sanctum::actingAs($this->user);
+
+        Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Alpha Deal']);
+        Opportunity::factory()->recycle([$this->user, $this->workspace])->create(['name' => 'Zulu Deal']);
+
+        $response = $this->getJson('/api/v1/opportunities?sort=-name');
+
+        $response->assertOk();
+
+        $names = collect($response->json('data'))->pluck('attributes.name')->values();
+        $zuluIndex = $names->search('Zulu Deal');
+        $alphaIndex = $names->search('Alpha Deal');
+        expect($zuluIndex)->toBeLessThan($alphaIndex);
+    });
+
+    it('rejects disallowed filter fields', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $this->getJson('/api/v1/opportunities?filter[workspace_id]=fake')
+            ->assertUnprocessable()
+            ->assertJsonValidationErrors(['filter.workspace_id']);
+    });
+
+    it('rejects disallowed sort fields', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $this->getJson('/api/v1/opportunities?sort=workspace_id')
+            ->assertStatus(400);
+    });
+});
+
+describe('pagination', function (): void {
+    it('paginates with per_page parameter', function (): void {
+        Sanctum::actingAs($this->user);
+
+        Opportunity::factory(5)->recycle([$this->user, $this->workspace])->create();
+
+        $this->getJson('/api/v1/opportunities?per_page=2')
+            ->assertOk()
+            ->assertJsonCount(2, 'data');
+    });
+
+    it('returns second page of results', function (): void {
+        Sanctum::actingAs($this->user);
+
+        Opportunity::factory(5)->recycle([$this->user, $this->workspace])->create();
+
+        $page1 = $this->getJson('/api/v1/opportunities?per_page=3&page=1');
+        $page2 = $this->getJson('/api/v1/opportunities?per_page=3&page=2');
+
+        $page1->assertOk()->assertJsonCount(3, 'data');
+        $page2->assertOk();
+
+        $page1Ids = collect($page1->json('data'))->pluck('id');
+        $page2Ids = collect($page2->json('data'))->pluck('id');
+        expect($page1Ids->intersect($page2Ids))->toBeEmpty();
+    });
+
+    it('caps per_page at maximum allowed value', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $this->getJson('/api/v1/opportunities?per_page=500')
+            ->assertUnprocessable()
+            ->assertInvalid(['per_page']);
+    });
+
+    it('returns empty data array for page beyond results', function (): void {
+        Sanctum::actingAs($this->user);
+
+        Opportunity::factory(2)->recycle([$this->user, $this->workspace])->create();
+
+        $this->getJson('/api/v1/opportunities?page=999')
+            ->assertOk()
+            ->assertJsonCount(0, 'data');
+    });
+});
+
+describe('mass assignment protection', function (): void {
+    it('ignores workspace_id in create request', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $otherWorkspace = Workspace::factory()->create();
+
+        $this->postJson('/api/v1/opportunities', [
+            'name' => 'Test Deal',
+            'workspace_id' => $otherWorkspace->id,
+        ])
+            ->assertCreated();
+
+        $opportunity = Opportunity::query()->where('name', 'Test Deal')->first();
+        expect($opportunity->workspace_id)->toBe($this->workspace->id);
+    });
+
+    it('ignores creator_id in create request', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $otherUser = User::factory()->create();
+
+        $this->postJson('/api/v1/opportunities', [
+            'name' => 'Test Deal',
+            'creator_id' => $otherUser->id,
+        ])
+            ->assertCreated();
+
+        $opportunity = Opportunity::query()->where('name', 'Test Deal')->first();
+        expect($opportunity->creator_id)->toBe($this->user->id);
+    });
+
+    it('ignores workspace_id in update request', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $opportunity = Opportunity::factory()->recycle([$this->user, $this->workspace])->create();
+        $otherWorkspace = Workspace::factory()->create();
+
+        $this->putJson("/api/v1/opportunities/{$opportunity->id}", [
+            'name' => 'Updated',
+            'workspace_id' => $otherWorkspace->id,
+        ])
+            ->assertOk();
+
+        expect($opportunity->refresh()->workspace_id)->toBe($this->workspace->id);
+    });
+});
+
+describe('input validation', function (): void {
+    it('rejects name exceeding 255 characters', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $this->postJson('/api/v1/opportunities', ['name' => str_repeat('a', 256)])
+            ->assertUnprocessable()
+            ->assertInvalid(['name']);
+    });
+
+    it('rejects non-string name', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $this->postJson('/api/v1/opportunities', ['name' => 12345])
+            ->assertUnprocessable()
+            ->assertInvalid(['name']);
+    });
+
+    it('rejects array as name', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $this->postJson('/api/v1/opportunities', ['name' => ['nested' => 'value']])
+            ->assertUnprocessable()
+            ->assertInvalid(['name']);
+    });
+
+    it('accepts name at exactly 255 characters', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $this->postJson('/api/v1/opportunities', ['name' => str_repeat('a', 255)])
+            ->assertCreated();
+    });
+
+    it('accepts null to clear a date custom field', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $section = CustomFieldSection::factory()->create([
+            'tenant_id' => $this->workspace->id,
+            'entity_type' => 'opportunity',
+            'name' => 'Date Fields',
+            'code' => 'date_fields_test',
+            'type' => 'section',
+            'sort_order' => 99,
+            'active' => true,
+        ]);
+
+        CustomField::factory()->create([
+            'tenant_id' => $this->workspace->id,
+            'custom_field_section_id' => $section->id,
+            'entity_type' => 'opportunity',
+            'code' => 'target_close_date',
+            'name' => 'Target Close Date',
+            'type' => 'date',
+            'sort_order' => 1,
+            'active' => true,
+            'validation_rules' => [],
+        ]);
+
+        $opportunity = Opportunity::factory()->recycle([$this->user, $this->workspace])->create();
+
+        $this->putJson("/api/v1/opportunities/{$opportunity->id}", [
+            'name' => $opportunity->name,
+            'custom_fields' => ['target_close_date' => null],
+        ])
+            ->assertOk()
+            ->assertValid();
+    });
+
+    it('accepts null to clear a datetime custom field', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $section = CustomFieldSection::factory()->create([
+            'tenant_id' => $this->workspace->id,
+            'entity_type' => 'opportunity',
+            'name' => 'Timestamps',
+            'code' => 'timestamps',
+            'type' => 'section',
+            'sort_order' => 2,
+            'active' => true,
+        ]);
+
+        CustomField::factory()->create([
+            'tenant_id' => $this->workspace->id,
+            'custom_field_section_id' => $section->id,
+            'entity_type' => 'opportunity',
+            'code' => 'last_contacted_at',
+            'name' => 'Last Contacted At',
+            'type' => 'date-time',
+            'sort_order' => 1,
+            'active' => true,
+            'validation_rules' => [],
+        ]);
+
+        $opportunity = Opportunity::factory()->recycle([$this->user, $this->workspace])->create();
+
+        $this->putJson("/api/v1/opportunities/{$opportunity->id}", [
+            'name' => $opportunity->name,
+            'custom_fields' => ['last_contacted_at' => null],
+        ])
+            ->assertOk()
+            ->assertValid();
+    });
+});
+
+describe('soft deletes', function (): void {
+    it('excludes soft-deleted opportunities from list', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $opportunity = Opportunity::factory()->recycle([$this->user, $this->workspace])->create();
+        $deleted = Opportunity::factory()->recycle([$this->user, $this->workspace])->create();
+        $deleted->delete();
+
+        $ids = collect($this->getJson('/api/v1/opportunities')->json('data'))->pluck('id');
+        expect($ids)->toContain($opportunity->id);
+        expect($ids)->not->toContain($deleted->id);
+    });
+
+    it('cannot show a soft-deleted opportunity', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $opportunity = Opportunity::factory()->recycle([$this->user, $this->workspace])->create();
+        $opportunity->delete();
+
+        $this->getJson("/api/v1/opportunities/{$opportunity->id}")
+            ->assertNotFound();
+    });
+});
+
+describe('non-existent record', function (): void {
+    it('returns 404 for non-existent opportunity', function (): void {
+        Sanctum::actingAs($this->user);
+
+        $this->getJson('/api/v1/opportunities/'.Str::ulid())
+            ->assertNotFound();
+    });
+});
+
+it('includes company_id and contact_id in attributes', function (): void {
+    Sanctum::actingAs($this->user);
+
+    $company = Company::factory()->recycle([$this->user, $this->workspace])->create();
+    $person = People::factory()->recycle([$this->user, $this->workspace])->create();
+    $opportunity = Opportunity::factory()->recycle([$this->user, $this->workspace])->create([
+        'company_id' => $company->id,
+        'contact_id' => $person->id,
+    ]);
+
+    $this->getJson("/api/v1/opportunities/{$opportunity->id}")
+        ->assertOk()
+        ->assertJson(fn (AssertableJson $json) => $json
+            ->has('data.attributes', fn (AssertableJson $json) => $json
+                ->where('company_id', $company->id)
+                ->where('contact_id', $person->id)
+                ->etc()
+            )
+            ->etc()
+        );
+});

@@ -1,0 +1,142 @@
+<?php
+
+declare(strict_types=1);
+
+namespace App\Models;
+
+use App\Enums\CreationSource;
+use App\Enums\MediaCollection;
+use App\Models\Concerns\BelongsToWorkspaceCreator;
+use App\Models\Concerns\HasCreator;
+use App\Models\Concerns\HasWorkspace;
+use App\Models\Pivots\Taskable;
+use App\Models\Pivots\TaskAssignee;
+use App\Models\Scopes\WorkspaceScope;
+use App\Support\Media\UploadAllowlist;
+use Carbon\CarbonImmutable;
+use Database\Factories\TaskFactory;
+use Illuminate\Database\Eloquent\Attributes\Fillable;
+use Illuminate\Database\Eloquent\Attributes\ScopedBy;
+use Illuminate\Database\Eloquent\Concerns\HasUlids;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsToMany;
+use Illuminate\Database\Eloquent\Relations\MorphToMany;
+use Illuminate\Database\Eloquent\SoftDeletes;
+use Relaticle\ActivityLog\Concerns\InteractsWithTimeline;
+use Relaticle\ActivityLog\Contracts\HasTimeline;
+use Relaticle\ActivityLog\Timeline\TimelineBuilder;
+use Relaticle\CustomFields\Models\Concerns\UsesCustomFields;
+use Relaticle\CustomFields\Models\Contracts\HasCustomFields;
+use Spatie\Activitylog\Models\Concerns\LogsActivity;
+use Spatie\Activitylog\Support\LogOptions;
+use Spatie\EloquentSortable\SortableTrait;
+use Spatie\MediaLibrary\HasMedia;
+use Spatie\MediaLibrary\InteractsWithMedia;
+
+/**
+ * @property int $id
+ * @property CarbonImmutable|null $deleted_at
+ * @property CreationSource $creation_source
+ * @property string $createdBy
+ */
+#[ScopedBy(WorkspaceScope::class)]
+#[Fillable([
+    'user_id',
+    'title',
+    'creation_source',
+])]
+final class Task extends Model implements HasCustomFields, HasMedia, HasTimeline
+{
+    use BelongsToWorkspaceCreator;
+    use HasCreator;
+
+    /** @use HasFactory<TaskFactory> */
+    use HasFactory;
+
+    use HasUlids;
+    use HasWorkspace;
+    use InteractsWithMedia;
+    use InteractsWithTimeline;
+    use LogsActivity;
+    use SoftDeletes;
+    use SortableTrait;
+    use UsesCustomFields;
+
+    /**
+     * The attributes that should be cast.
+     *
+     * @return array<string, string|class-string>
+     */
+    protected function casts(): array
+    {
+        return [
+            'creation_source' => CreationSource::class,
+        ];
+    }
+
+    /**
+     * @var array{order_column_name: 'order_column', sort_when_creating: true}
+     */
+    public array $sortable = [
+        'order_column_name' => 'order_column',
+        'sort_when_creating' => true,
+    ];
+
+    /**
+     * @return BelongsToMany<User, $this, TaskAssignee>
+     */
+    public function assignees(): BelongsToMany
+    {
+        return $this->belongsToMany(User::class)->using(TaskAssignee::class);
+    }
+
+    /**
+     * @return MorphToMany<Company, $this, Taskable>
+     */
+    public function companies(): MorphToMany
+    {
+        return $this->morphedByMany(Company::class, 'taskable')->using(Taskable::class);
+    }
+
+    /**
+     * @return MorphToMany<Opportunity, $this, Taskable>
+     */
+    public function opportunities(): MorphToMany
+    {
+        return $this->morphedByMany(Opportunity::class, 'taskable')->using(Taskable::class);
+    }
+
+    /**
+     * @return MorphToMany<People, $this, Taskable>
+     */
+    public function people(): MorphToMany
+    {
+        return $this->morphedByMany(People::class, 'taskable')->using(Taskable::class);
+    }
+
+    public function registerMediaCollections(): void
+    {
+        $this->addMediaCollection(MediaCollection::Attachments->value)
+            ->acceptsMimeTypes(UploadAllowlist::mimeTypes());
+    }
+
+    public function getActivitylogOptions(): LogOptions
+    {
+        return LogOptions::defaults()
+            ->logAll()
+            ->logOnlyDirty()
+            ->dontLogEmptyChanges()
+            ->logExcept([
+                'id', 'workspace_id', 'creator_id', 'creation_source', 'custom_fields',
+                'created_at', 'updated_at', 'deleted_at', 'order_column',
+            ])
+            ->useLogName('crm')
+            ->setDescriptionForEvent(fn (string $eventName): string => $eventName);
+    }
+
+    public function timeline(): TimelineBuilder
+    {
+        return TimelineBuilder::make($this)->fromActivityLog(mergedRenderer: 'merged-activity');
+    }
+}

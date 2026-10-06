@@ -1,0 +1,61 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Relaticle\Chat\Tools;
+
+use App\Models\Company;
+use App\Models\Note;
+use App\Models\Opportunity;
+use App\Models\People;
+use App\Models\Task;
+use App\Models\User;
+use Illuminate\Contracts\JsonSchema\JsonSchema;
+use Illuminate\Support\Facades\Date;
+use Laravel\Ai\Contracts\Tool;
+use Laravel\Ai\Tools\Request;
+
+final class GetCrmSummaryTool implements Tool
+{
+    public function description(): string
+    {
+        return 'Get a summary of CRM data: record counts and recent activity.';
+    }
+
+    public function schema(JsonSchema $schema): array
+    {
+        return [];
+    }
+
+    public function handle(Request $request): string
+    {
+        /** @var User $user */
+        $user = auth()->user();
+        $workspace = $user->currentWorkspace;
+
+        /**
+         * "This week" is the user's week, not the server's. Bounded on UTC, the counts
+         * shift by a day for anyone far enough east or west.
+         */
+        $startOfWeek = Date::now($user->effectiveTimezone())
+            ->startOfWeek()
+            ->utc();
+
+        $summary = [
+            'record_counts' => [
+                'companies' => Company::query()->whereBelongsTo($workspace)->count(),
+                'people' => People::query()->whereBelongsTo($workspace)->count(),
+                'opportunities' => Opportunity::query()->whereBelongsTo($workspace)->count(),
+                'tasks' => Task::query()->whereBelongsTo($workspace)->count(),
+                'notes' => Note::query()->whereBelongsTo($workspace)->count(),
+            ],
+            'recent_activity' => [
+                'companies_this_week' => Company::query()->whereBelongsTo($workspace)->where('created_at', '>=', $startOfWeek)->count(),
+                'tasks_this_week' => Task::query()->whereBelongsTo($workspace)->where('created_at', '>=', $startOfWeek)->count(),
+                'opportunities_this_week' => Opportunity::query()->whereBelongsTo($workspace)->where('created_at', '>=', $startOfWeek)->count(),
+            ],
+        ];
+
+        return (string) json_encode($summary, JSON_UNESCAPED_SLASHES);
+    }
+}

@@ -1,0 +1,37 @@
+<?php
+
+declare(strict_types=1);
+
+namespace App\Filament\Resources\OpportunityResource\Forms;
+
+use App\Filament\Components\Forms\RecordSelect;
+use Filament\Forms\Components\TextInput;
+use Filament\Schemas\Schema;
+use Relaticle\CustomFields\Facades\CustomFields;
+
+final class OpportunityForm
+{
+    public static function get(Schema $schema): Schema
+    {
+        return $schema
+            ->components([
+                TextInput::make('name')
+                    ->required()
+                    ->placeholder(__('filament/resources/opportunity.fields.name.placeholder'))
+                    ->columnSpanFull(),
+                RecordSelect::make('company_id')
+                    ->relationship('company', 'name')
+                    ->searchable()
+                    ->preload()
+                    ->columnSpan(2),
+                RecordSelect::make('contact_id')
+                    ->label(__('filament/resources/opportunity.fields.contact_id.label'))
+                    ->relationship('contact', 'name')
+                    ->searchable()
+                    ->preload()
+                    ->columnSpan(2),
+                CustomFields::form()->build()->columnSpanFull()->columns(1),
+            ])
+            ->columns(4);
+    }
+}

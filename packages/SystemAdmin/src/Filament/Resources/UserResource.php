@@ -1,0 +1,334 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Relaticle\SystemAdmin\Filament\Resources;
+
+use App\Enums\Notifications\NotificationChannel;
+use App\Enums\Notifications\NotificationType;
+use App\Enums\SubscriberTagEnum;
+use App\Models\User;
+use Filament\Actions\BulkActionGroup;
+use Filament\Actions\EditAction;
+use Filament\Actions\ViewAction;
+use Filament\Forms\Components\DatePicker;
+use Filament\Forms\Components\DateTimePicker;
+use Filament\Forms\Components\Select;
+use Filament\Forms\Components\TextInput;
+use Filament\Forms\Components\Toggle;
+use Filament\Infolists\Components\IconEntry;
+use Filament\Infolists\Components\TextEntry;
+use Filament\Resources\Resource;
+use Filament\Schemas\Components\Fieldset;
+use Filament\Schemas\Components\Section;
+use Filament\Schemas\Schema;
+use Filament\Tables\Columns\IconColumn;
+use Filament\Tables\Columns\TextColumn;
+use Filament\Tables\Filters\Filter;
+use Filament\Tables\Filters\Indicator;
+use Filament\Tables\Filters\SelectFilter;
+use Filament\Tables\Filters\TernaryFilter;
+use Filament\Tables\Table;
+use Illuminate\Database\Eloquent\Builder;
+use Laravel\Jetstream\Contracts\DeletesUsers;
+use Override;
+use Relaticle\SystemAdmin\Filament\Resources\UserResource\Pages\CreateUser;
+use Relaticle\SystemAdmin\Filament\Resources\UserResource\Pages\EditUser;
+use Relaticle\SystemAdmin\Filament\Resources\UserResource\Pages\ListUsers;
+use Relaticle\SystemAdmin\Filament\Resources\UserResource\Pages\ViewUser;
+use Relaticle\SystemAdmin\Filament\Resources\UserResource\RelationManagers\OwnedWorkspacesRelationManager;
+use Relaticle\SystemAdmin\Filament\Resources\UserResource\RelationManagers\SocialAccountsRelationManager;
+use Relaticle\SystemAdmin\Filament\Resources\UserResource\RelationManagers\WorkspacesRelationManager;
+use Relaticle\SystemAdmin\Filament\Support\Impersonate;
+use Relaticle\SystemAdmin\Filament\Support\RecordLink;
+use Relaticle\SystemAdmin\Filament\Support\SafeDelete;
+use Relaticle\SystemAdmin\Filament\Support\ViewerTime;
+use Relaticle\SystemAdmin\Metrics\Scopes\GenuineSignup;
+use Relaticle\SystemAdmin\Metrics\Scopes\ReachedFirstValue;
+use Relaticle\SystemAdmin\Metrics\SignupMethod;
+
+final class UserResource extends Resource
+{
+    protected static ?string $model = User::class;
+
+    protected static string|\BackedEnum|null $navigationIcon = 'heroicon-o-user';
+
+    protected static string|\UnitEnum|null $navigationGroup = 'User Management';
+
+    protected static ?int $navigationSort = 1;
+
+    protected static ?string $modelLabel = 'User';
+
+    protected static ?string $pluralModelLabel = 'Users';
+
+    protected static ?string $slug = 'users';
+
+    public static function getNavigationBadge(): ?string
+    {
+        $count = self::getModel()::query()->count();
+
+        return $count > 0 ? (string) $count : null;
+    }
+
+    #[Override]
+    public static function form(Schema $schema): Schema
+    {
+        return $schema
+            ->components([
+                TextInput::make('name')
+                    ->required()
+                    ->maxLength(255),
+                TextInput::make('email')
+                    ->disabled(fn (string $operation): bool => $operation === 'edit' && ! auth('sysadmin')->user()?->role->canManageCustomerAccess())
+                    ->dehydrated()
+                    ->email()
+                    ->required()
+                    ->maxLength(255)
+                    ->unique(ignoreRecord: true),
+                DateTimePicker::make('email_verified_at')
+                    ->disabled(fn (string $operation): bool => $operation === 'edit' && ! auth('sysadmin')->user()?->role->canManageCustomerAccess())
+                    ->dehydrated(),
+                TextInput::make('password')
+                    ->disabled(fn (string $operation): bool => $operation === 'edit' && ! auth('sysadmin')->user()?->role->canManageCustomerAccess())
+                    ->password()
+                    ->maxLength(255)
+                    ->dehydrated(fn (?string $state): bool => filled($state))
+                    ->required(fn (string $operation): bool => $operation === 'create'),
+                Select::make('current_workspace_id')
+                    ->searchable()
+                    ->relationship('currentWorkspace', 'name'),
+                Section::make('Notifications')
+                    ->description('Overrides what this user receives. Mirrors their own notification settings page.')
+                    ->schema(self::notificationPreferenceFields())
+                    ->columnSpanFull(),
+            ]);
+    }
+
+    /**
+     * @return array<int, Fieldset>
+     */
+    private static function notificationPreferenceFields(): array
+    {
+        return array_map(
+            fn (NotificationType $type): Fieldset => Fieldset::make($type->label())
+                ->schema(array_map(
+                    fn (NotificationChannel $channel): Toggle => Toggle::make(
+                        "notification_preferences.{$type->value}.{$channel->value}"
+                    )
+                        ->label($channel->label())
+                        ->formatStateUsing(
+                            fn (?User $record): bool => $record?->wantsNotification($type, $channel)
+                                ?? $type->defaultEnabled($channel)
+                        ),
+                    $type->channels(),
+                )),
+            NotificationType::cases(),
+        );
+    }
+
+    #[Override]
+    public static function infolist(Schema $schema): Schema
+    {
+        return $schema
+            ->components([
+                Section::make([
+                    TextEntry::make('name'),
+                    TextEntry::make('email'),
+                    IconEntry::make('email_verified_at')
+                        ->label('Verified')
+                        ->boolean(),
+                    TextEntry::make('currentWorkspace.name')
+                        ->label('Current Workspace')
+                        ->color('primary')
+                        ->url(RecordLink::to(WorkspaceResource::class, 'currentWorkspace')),
+                    TextEntry::make('last_login_at')
+                        ->label('Last Login')
+                        ->dateTime()
+                        ->placeholder('Never'),
+                    TextEntry::make('engagement')
+                        ->label('Engagement')
+                        ->state(self::engagementBadge(...))
+                        ->badge()
+                        ->placeholder('—'),
+                    TextEntry::make('created_at')
+                        ->dateTime(),
+                    TextEntry::make('updated_at')
+                        ->dateTime(),
+                ])->columnSpanFull()->columns(),
+            ]);
+    }
+
+    #[Override]
+    public static function table(Table $table): Table
+    {
+        return $table
+            ->modifyQueryUsing(fn (Builder $query): Builder => $query->with('socialAccounts'))
+            ->defaultSort('created_at', 'desc')
+            ->columns([
+                TextColumn::make('name')
+                    ->searchable()
+                    ->sortable(),
+                TextColumn::make('email')
+                    ->searchable()
+                    ->sortable()
+                    ->copyable(),
+                IconColumn::make('email_verified_at')
+                    ->label('Verified')
+                    ->boolean()
+                    ->trueIcon('heroicon-o-check-badge')
+                    ->falseIcon('heroicon-o-x-mark'),
+                TextColumn::make('signup_method')
+                    ->label('Signup method')
+                    ->state(fn (User $record): string => SignupMethod::for($record))
+                    ->badge()
+                    ->toggleable(),
+                TextColumn::make('currentWorkspace.name')
+                    ->label('Current Workspace')
+                    ->sortable()
+                    ->color('primary')
+                    ->url(RecordLink::to(WorkspaceResource::class, 'currentWorkspace')),
+                TextColumn::make('last_login_at')
+                    ->label('Last Login')
+                    ->dateTime()
+                    ->sortable()
+                    ->toggleable()
+                    ->placeholder('Never'),
+                TextColumn::make('engagement')
+                    ->label('Engagement')
+                    ->state(self::engagementBadge(...))
+                    ->badge()
+                    ->sortable(query: fn (Builder $query, string $direction): Builder => $query->orderBy('last_login_at', $direction))
+                    ->toggleable()
+                    ->placeholder('—'),
+                IconColumn::make('rejected_subscriber_profile_hash')
+                    ->label('Mailcoach Rejected')
+                    ->state(fn (User $record): bool => $record->rejected_subscriber_profile_hash !== null)
+                    ->boolean()
+                    ->trueIcon('heroicon-o-exclamation-triangle')
+                    ->trueColor('warning')
+                    ->falseIcon('heroicon-o-minus-small')
+                    ->falseColor('gray')
+                    ->toggleable(isToggledHiddenByDefault: true),
+                TextColumn::make('email_bounced_at')
+                    ->label('Email Bounced')
+                    ->dateTime()
+                    ->sortable()
+                    ->toggleable()
+                    ->placeholder('No'),
+                TextColumn::make('created_at')
+                    ->dateTime()
+                    ->sortable(),
+                TextColumn::make('updated_at')
+                    ->dateTime()
+                    ->sortable(),
+            ])
+            ->filters([
+                TernaryFilter::make('email_verified_at')
+                    ->label('Email Verified')
+                    ->nullable(),
+                TernaryFilter::make('rejected_subscriber_profile_hash')
+                    ->label('Mailcoach Rejected')
+                    ->placeholder('All users')
+                    ->trueLabel('Rejected by Mailcoach')
+                    ->falseLabel('Not rejected')
+                    ->nullable(),
+                TernaryFilter::make('email_bounced_at')
+                    ->label('Email Bounced')
+                    ->placeholder('All users')
+                    ->trueLabel('Bounced')
+                    ->falseLabel('Not bounced')
+                    ->nullable(),
+                SelectFilter::make('engagement')
+                    ->label('Engagement')
+                    ->options([
+                        SubscriberTagEnum::Active7d->value => 'Active (7d)',
+                        SubscriberTagEnum::Active30d->value => 'Active (30d)',
+                        SubscriberTagEnum::Dormant->value => 'Dormant',
+                    ])
+                    ->query(fn (Builder $query, array $data): Builder => SubscriberTagEnum::applyRecencyWindow(
+                        $query,
+                        $data['value'] ?? null,
+                    )),
+                Filter::make('genuine_signup')
+                    ->label('Genuine signup')
+                    ->toggle()
+                    ->query(function (Builder $query): Builder {
+                        (new GenuineSignup)->apply($query, $query->getModel());
+
+                        return $query;
+                    }),
+                Filter::make('reached_first_value')
+                    ->label('Reached first value')
+                    ->toggle()
+                    ->query(function (Builder $query): Builder {
+                        (new ReachedFirstValue)->apply($query, $query->getModel());
+
+                        return $query;
+                    }),
+                Filter::make('no_workspace')
+                    ->label('No workspace')
+                    ->toggle()
+                    ->query(fn (Builder $query): Builder => $query->whereDoesntHave('ownedWorkspaces')->whereDoesntHave('workspaces')),
+                Filter::make('signed_up')
+                    ->schema([
+                        DatePicker::make('from')->label('Signed up from'),
+                        DatePicker::make('until')->label('Signed up until'),
+                    ])
+                    ->query(fn (Builder $query, array $data): Builder => $query
+                        ->when($data['from'] ?? null, fn (Builder $q, mixed $date): Builder => $q->where('users.created_at', '>=', ViewerTime::startOfDayUtc((string) $date)))
+                        ->when($data['until'] ?? null, fn (Builder $q, mixed $date): Builder => $q->where('users.created_at', '<=', ViewerTime::endOfDayUtc((string) $date))))
+                    ->indicateUsing(fn (array $data): array => collect(['from' => 'Signed up from', 'until' => 'Signed up until'])
+                        ->filter(fn (string $label, string $field): bool => is_string($data[$field] ?? null) && $data[$field] !== '')
+                        ->map(fn (string $label, string $field): Indicator => Indicator::make("{$label}: {$data[$field]}")->removeField($field))
+                        ->values()
+                        ->all()),
+            ])
+            ->recordActions([
+                ViewAction::make(),
+                EditAction::make()->action(null),
+                Impersonate::user(),
+            ])
+            ->toolbarActions([
+                BulkActionGroup::make([
+                    SafeDelete::bulkAction(function (User $record): void {
+                        resolve(DeletesUsers::class)->delete($record);
+                    }),
+                ]),
+            ]);
+    }
+
+    public static function engagementBadge(User $record): ?string
+    {
+        return SubscriberTagEnum::recencyBucketFor($record->last_login_at)?->value;
+    }
+
+    /**
+     * @return Builder<User>
+     */
+    public static function getEloquentQuery(): Builder
+    {
+        return parent::getEloquentQuery()
+            ->with(['currentWorkspace', 'ownedWorkspaces']);
+    }
+
+    #[Override]
+    public static function getRelations(): array
+    {
+        return [
+            OwnedWorkspacesRelationManager::class,
+            WorkspacesRelationManager::class,
+            SocialAccountsRelationManager::class,
+        ];
+    }
+
+    #[Override]
+    public static function getPages(): array
+    {
+        return [
+            'index' => ListUsers::route('/'),
+            'create' => CreateUser::route('/create'),
+            'view' => ViewUser::route('/{record}'),
+            'edit' => EditUser::route('/{record}/edit'),
+        ];
+    }
+}

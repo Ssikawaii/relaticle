@@ -1,0 +1,30 @@
+<?php
+
+declare(strict_types=1);
+
+namespace App\Http\Requests\Api\V1;
+
+use App\Enums\CrmEntity;
+use App\Models\User;
+use Illuminate\Validation\Rule;
+
+final class StorePeopleRequest extends BaseCrmEntityRequest
+{
+    protected function entity(): CrmEntity
+    {
+        return CrmEntity::People;
+    }
+
+    /**
+     * @return array<string, array<int, mixed>>
+     */
+    protected function entityRules(User $user): array
+    {
+        $workspaceId = $user->currentWorkspace->getKey();
+
+        return [
+            'name' => ['required', 'string', 'max:255'],
+            'company_id' => ['nullable', 'string', Rule::exists('companies', 'id')->where('workspace_id', $workspaceId)],
+        ];
+    }
+}

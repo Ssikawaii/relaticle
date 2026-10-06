@@ -1,0 +1,72 @@
+<?php
+
+declare(strict_types=1);
+
+use App\Models\User;
+use Filament\Facades\Filament;
+use Illuminate\Support\Facades\DB;
+use Relaticle\Chat\Queries\ConversationMessagesQuery;
+use Tests\Helpers\ChatDocument;
+
+mutates(ConversationMessagesQuery::class);
+
+beforeEach(function (): void {
+    $this->user = User::factory()->withPersonalWorkspace()->create();
+    $this->workspace = $this->user->currentWorkspace;
+    $this->actingAs($this->user);
+    Filament::setTenant($this->workspace);
+
+    DB::table('agent_conversations')->insert([
+        'id' => 'c-page',
+        'participant_type' => 'user',
+        'participant_id' => $this->user->getKey(),
+        'workspace_id' => $this->workspace->getKey(),
+        'title' => 'Page',
+        'created_at' => now(),
+        'updated_at' => now(),
+    ]);
+
+    foreach (range(1, 75) as $i) {
+        DB::table('agent_conversation_messages')->insert([
+            'id' => sprintf('m-%03d', $i),
+            'conversation_id' => 'c-page',
+            'participant_type' => 'user',
+            'participant_id' => $this->user->getKey(),
+            'agent' => 'Relaticle\\Chat\\Agents\\CrmAssistant',
+            'role' => $i % 2 === 0 ? 'assistant' : 'user',
+            'content' => "msg {$i}",
+            'document' => ChatDocument::emptyJson(),
+            'attachments' => '[]',
+            'steps' => '[]',
+            'usage' => '{}',
+            'meta' => '{}',
+            'created_at' => now()->subSeconds(100 - $i),
+            'updated_at' => now()->subSeconds(100 - $i),
+        ]);
+    }
+});
+
+it('returns the last 50 messages by default', function (): void {
+    $result = resolve(ConversationMessagesQuery::class)->get($this->user, 'c-page');
+
+    expect($result)->toHaveCount(50);
+});
+
+it('returns earlier messages with beforeMessageId cursor', function (): void {
+    $result = resolve(ConversationMessagesQuery::class)->get($this->user, 'c-page', beforeMessageId: 'm-026');
+
+    expect($result)->toHaveCount(25);
+    expect($result[0]['content'])->toContain('msg 1');
+    expect($result[24]['content'])->toContain('msg 25');
+});
+
+it('still fills a whole page when an approval marker sits inside the window', function (): void {
+    DB::table('agent_conversation_messages')
+        ->where('id', 'm-050')
+        ->update(['role' => 'user', 'origin' => 'resume', 'content' => 'The user decided the proposals above.']);
+
+    $result = resolve(ConversationMessagesQuery::class)->get($this->user, 'c-page');
+
+    expect($result)->toHaveCount(50)
+        ->and(array_column($result, 'id'))->not->toContain('m-050');
+});

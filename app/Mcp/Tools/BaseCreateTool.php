@@ -1,0 +1,98 @@
+<?php
+
+declare(strict_types=1);
+
+namespace App\Mcp\Tools;
+
+use App\Mcp\Tools\Concerns\ChecksTokenAbility;
+use App\Mcp\Tools\Concerns\HasExplicitToolAnnotations;
+use App\Models\User;
+use App\Rules\ValidCustomFields;
+use App\Support\CustomFields\CustomFieldInput;
+use Illuminate\Contracts\JsonSchema\JsonSchema;
+use Illuminate\Http\Resources\Json\JsonResource;
+use Laravel\Mcp\Request;
+use Laravel\Mcp\Response;
+use Laravel\Mcp\ResponseFactory;
+use Laravel\Mcp\Server\Tool;
+
+abstract class BaseCreateTool extends Tool
+{
+    use ChecksTokenAbility;
+    use HasExplicitToolAnnotations;
+
+    protected function destructiveHint(): bool
+    {
+        return false;
+    }
+
+    /** @return class-string */
+    abstract protected function actionClass(): string;
+
+    /** @return class-string<JsonResource> */
+    abstract protected function resourceClass(): string;
+
+    abstract protected function entityType(): string;
+
+    /**
+     * @return array<string, mixed>
+     */
+    abstract protected function entitySchema(JsonSchema $schema): array;
+
+    /**
+     * @return array<string, array<int, mixed>>
+     */
+    abstract protected function entityRules(User $user): array;
+
+    public function schema(JsonSchema $schema): array
+    {
+        return array_merge(
+            $this->entitySchema($schema),
+            [
+                'custom_fields' => $schema->object()->description('Custom field values as key-value pairs. IMPORTANT: You MUST first read the crm-schema resource to discover valid field codes for this entity type. Unknown field codes will be rejected. Use exact field codes from the schema (e.g. "job_title", not "jobTitle").'),
+            ],
+        );
+    }
+
+    public function outputSchema(JsonSchema $schema): array
+    {
+        return ['data' => $schema->object()->required()];
+    }
+
+    public function handle(Request $request): Response|ResponseFactory
+    {
+        if (($denied = $this->denyIfTokenCannot('create')) instanceof Response) {
+            return $denied;
+        }
+
+        /** @var User $user */
+        $user = auth()->user();
+
+        $customFields = $request->get('custom_fields');
+
+        if (is_array($customFields)) {
+            $customFields = resolve(CustomFieldInput::class)->normalize($user->currentWorkspace->getKey(), $this->entityType(), $customFields);
+            $request->merge(['custom_fields' => $customFields]);
+        }
+
+        $rules = array_merge(
+            $this->entityRules($user),
+            new ValidCustomFields($user->currentWorkspace->getKey(), $this->entityType())->toRules($customFields),
+        );
+
+        $validated = $request->validate($rules);
+
+        $action = app()->make($this->actionClass());
+        $model = $action->execute($user, $validated);
+
+        /** @var class-string<JsonResource> $resourceClass */
+        $resourceClass = $this->resourceClass();
+
+        $payload = (array) json_decode(
+            new $resourceClass($model->loadMissing('customFieldValues.customField.options'))->toJson(),
+            flags: JSON_THROW_ON_ERROR,
+        );
+
+        return Response::structured($payload);
+    }
+}

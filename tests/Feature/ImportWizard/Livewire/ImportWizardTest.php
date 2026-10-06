@@ -1,0 +1,413 @@
+<?php
+
+declare(strict_types=1);
+
+use App\Events\WorkspaceCreated;
+use App\Models\User;
+use Filament\Facades\Filament;
+use Illuminate\Support\Facades\Bus;
+use Illuminate\Support\Facades\Event;
+use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
+use Livewire\Features\SupportTesting\Testable;
+use Livewire\Livewire;
+use Relaticle\ImportWizard\Data\ColumnData;
+use Relaticle\ImportWizard\Enums\ImportEntityType;
+use Relaticle\ImportWizard\Enums\ImportStatus;
+use Relaticle\ImportWizard\Exceptions\ImportStoreException;
+use Relaticle\ImportWizard\Livewire\ImportWizard;
+use Relaticle\ImportWizard\Models\Import;
+use Relaticle\ImportWizard\Store\ImportStore;
+
+mutates(ImportWizard::class);
+
+beforeEach(function (): void {
+    Event::fake()->except([WorkspaceCreated::class]);
+    Bus::fake();
+
+    $this->user = User::factory()->withWorkspace()->create();
+    $this->actingAs($this->user);
+    $this->workspace = $this->user->currentWorkspace;
+
+    Filament::setTenant($this->workspace);
+
+    $this->createdStoreIds = [];
+});
+
+afterEach(function (): void {
+    foreach ($this->createdStoreIds as $storeId) {
+        ImportStore::delete($storeId);
+        Import::find($storeId)?->delete();
+    }
+});
+
+function mountImportWizard(object $context, ?string $returnUrl = null): Testable
+{
+    return Livewire::test(ImportWizard::class, [
+        'entityType' => ImportEntityType::People,
+        'returnUrl' => $returnUrl,
+    ]);
+}
+
+function createFullTestStore(object $context): ImportStore
+{
+    $import = Import::factory()->create([
+        'workspace_id' => (string) $context->workspace->id,
+        'user_id' => (string) $context->user->id,
+        'entity_type' => ImportEntityType::People,
+        'file_name' => 'test.csv',
+        'status' => ImportStatus::Reviewing,
+        'total_rows' => 1,
+        'headers' => ['Name', 'Email'],
+    ]);
+
+    $import->setColumnMappings([
+        ColumnData::toField(source: 'Name', target: 'name'),
+    ]);
+
+    $store = ImportStore::create($import->id);
+    $store->query()->insert([
+        'row_number' => 2,
+        'raw_data' => json_encode(['Name' => 'John', 'Email' => 'john@test.com']),
+    ]);
+
+    $context->createdStoreIds[] = $store->id();
+
+    return $store;
+}
+
+function markStoreAsDestroyed(object $context, ImportStore $store): void
+{
+    $context->createdStoreIds = array_filter(
+        $context->createdStoreIds,
+        fn (string $id): bool => $id !== $store->id(),
+    );
+}
+
+it('mounts at step 1 (Upload)', function (): void {
+    $component = mountImportWizard($this);
+
+    $component->assertOk();
+    expect($component->get('currentStep'))->toBe(1);
+});
+
+it('onUploadCompleted advances to step 2 with store data', function (): void {
+    $store = createFullTestStore($this);
+
+    $component = mountImportWizard($this);
+    $component->call('onUploadCompleted', $store->id(), 5, 3);
+
+    expect($component->get('currentStep'))->toBe(2)
+        ->and($component->get('storeId'))->toBe($store->id())
+        ->and($component->get('rowCount'))->toBe(5)
+        ->and($component->get('columnCount'))->toBe(3);
+});
+
+it('goBack caps at step 1', function (): void {
+    $component = mountImportWizard($this);
+
+    $component->call('goBack');
+
+    expect($component->get('currentStep'))->toBe(1);
+});
+
+it('goToStep ignores forward navigation', function (): void {
+    $store = createFullTestStore($this);
+
+    $component = mountImportWizard($this);
+    $component->set('storeId', $store->id());
+    $component->set('currentStep', 2);
+
+    $component->call('goToStep', 3);
+
+    expect($component->get('currentStep'))->toBe(2);
+});
+
+it('goToStep navigates to completed step', function (): void {
+    $store = createFullTestStore($this);
+
+    $component = mountImportWizard($this);
+    $component->set('storeId', $store->id());
+    $component->set('currentStep', 3);
+
+    $component->call('goToStep', 2);
+
+    expect($component->get('currentStep'))->toBe(2);
+});
+
+it('cancelImport destroys store and redirects', function (): void {
+    $store = createFullTestStore($this);
+    $returnUrl = '/dashboard';
+
+    $component = mountImportWizard($this, $returnUrl);
+    $component->set('storeId', $store->id());
+    $component->call('cancelImport');
+
+    $component->assertRedirect($returnUrl);
+
+    expect(ImportStore::forRead($store->id()))->toBeNull();
+
+    markStoreAsDestroyed($this, $store);
+});
+
+it('cancelImport leaves the store of an import from another workspace untouched', function (): void {
+    $otherUser = User::factory()->withWorkspace()->create();
+
+    $foreignImport = Import::factory()->create([
+        'workspace_id' => (string) $otherUser->currentWorkspace->id,
+        'user_id' => (string) $otherUser->id,
+        'entity_type' => ImportEntityType::People,
+        'file_name' => 'test.csv',
+        'status' => ImportStatus::Mapping,
+        'total_rows' => 1,
+        'headers' => ['Name', 'Email'],
+    ]);
+    $foreignStore = ImportStore::create($foreignImport->id);
+    $this->createdStoreIds[] = $foreignStore->id();
+
+    mountImportWizard($this, '/dashboard')
+        ->set('storeId', $foreignStore->id())
+        ->call('cancelImport')
+        ->assertRedirect('/dashboard');
+
+    expect(ImportStore::exists($foreignStore->id()))->toBeTrue()
+        ->and(Import::query()->whereKey($foreignImport->id)->exists())->toBeTrue();
+});
+
+it('startOver resets to step 1', function (): void {
+    $store = createFullTestStore($this);
+
+    $component = mountImportWizard($this);
+    $component->set('storeId', $store->id());
+    $component->set('currentStep', 2);
+    $component->set('rowCount', 10);
+    $component->set('columnCount', 5);
+
+    $component->call('startOver');
+
+    expect($component->get('currentStep'))->toBe(1)
+        ->and($component->get('storeId'))->toBeNull()
+        ->and($component->get('rowCount'))->toBe(0)
+        ->and($component->get('columnCount'))->toBe(0);
+
+    expect(ImportStore::forRead($store->id()))->toBeNull();
+
+    markStoreAsDestroyed($this, $store);
+});
+
+it('getStepTitle returns correct title for Upload step', function (): void {
+    $component = mountImportWizard($this);
+
+    $component->call('getStepTitle')->assertReturned('Upload CSV');
+});
+
+it('getStepTitle returns correct title for Map step', function (): void {
+    $store = createFullTestStore($this);
+
+    $component = mountImportWizard($this);
+    $component->call('onUploadCompleted', $store->id(), 1, 2);
+
+    $component->call('getStepTitle')->assertReturned('Map Columns');
+});
+
+it('getStepDescription returns correct description per step', function (): void {
+    $component = mountImportWizard($this);
+
+    $component->call('getStepDescription')
+        ->assertReturned('Upload your CSV file to import People');
+});
+
+it('restores to mapping step when store status is Mapping', function (): void {
+    $store = createFullTestStore($this);
+    $import = Import::find($store->id());
+    $import->update(['status' => ImportStatus::Mapping]);
+
+    $component = Livewire::withQueryParams(['import' => $store->id()])
+        ->test(ImportWizard::class, [
+            'entityType' => ImportEntityType::People,
+        ]);
+
+    expect($component->get('currentStep'))->toBe(2)
+        ->and($component->get('storeId'))->toBe($store->id())
+        ->and($component->get('rowCount'))->toBe(1)
+        ->and($component->get('columnCount'))->toBe(2);
+});
+
+it('restores to review step when store status is Reviewing', function (): void {
+    $store = createFullTestStore($this);
+    $import = Import::find($store->id());
+    $import->update(['status' => ImportStatus::Reviewing]);
+
+    $component = Livewire::withQueryParams(['import' => $store->id()])
+        ->test(ImportWizard::class, [
+            'entityType' => ImportEntityType::People,
+        ]);
+
+    expect($component->get('currentStep'))->toBe(3)
+        ->and($component->get('storeId'))->toBe($store->id());
+});
+
+it('restores to preview step with locked navigation when store status is Completed', function (): void {
+    $store = createFullTestStore($this);
+    $import = Import::find($store->id());
+    $import->update(['status' => ImportStatus::Completed]);
+
+    $component = Livewire::withQueryParams(['import' => $store->id()])
+        ->test(ImportWizard::class, [
+            'entityType' => ImportEntityType::People,
+        ]);
+
+    expect($component->get('currentStep'))->toBe(4)
+        ->and($component->get('storeId'))->toBe($store->id())
+        ->and($component->get('importStarted'))->toBeTrue();
+});
+
+it('blocks navigation when import has started', function (): void {
+    $store = createFullTestStore($this);
+    $import = Import::find($store->id());
+    $import->update(['status' => ImportStatus::Importing]);
+
+    $component = Livewire::withQueryParams(['import' => $store->id()])
+        ->test(ImportWizard::class, [
+            'entityType' => ImportEntityType::People,
+        ]);
+
+    expect($component->get('importStarted'))->toBeTrue();
+
+    $component->call('goToStep', 2);
+    expect($component->get('currentStep'))->toBe(4);
+
+    $component->call('goBack');
+    expect($component->get('currentStep'))->toBe(4);
+});
+
+it('allows backward navigation during validation', function (): void {
+    $store = createFullTestStore($this);
+
+    $component = Livewire::withQueryParams(['import' => $store->id()])
+        ->test(ImportWizard::class, [
+            'entityType' => ImportEntityType::People,
+        ]);
+
+    expect($component->get('currentStep'))->toBe(3);
+
+    $component->call('goBack');
+    expect($component->get('currentStep'))->toBe(2);
+});
+
+it('resets storeId when store not found', function (): void {
+    $component = Livewire::withQueryParams(['import' => 'nonexistent-id'])
+        ->test(ImportWizard::class, [
+            'entityType' => ImportEntityType::People,
+        ]);
+
+    expect($component->get('currentStep'))->toBe(1)
+        ->and($component->get('storeId'))->toBeNull();
+});
+
+it('rejects path traversal storeId values', function (string $maliciousId): void {
+    expect(ImportStore::forRead($maliciousId))->toBeNull()
+        ->and(ImportStore::forExecution($maliciousId, 'execute:owner'))->toBeNull()
+        ->and(fn () => ImportStore::withWriteLock($maliciousId, fn (): null => null))->toThrow(ImportStoreException::class);
+})->with([
+    '../../etc/passwd',
+    '../../../secret',
+    'valid-but-has-slashes/nested',
+    '',
+    'short',
+    str_repeat('A', 27),
+]);
+
+it('resets storeId when store belongs to different workspace', function (): void {
+    $otherUser = User::factory()->withWorkspace()->create();
+    $otherWorkspace = $otherUser->currentWorkspace;
+
+    $import = Import::factory()->create([
+        'workspace_id' => (string) $otherWorkspace->id,
+        'user_id' => (string) $otherUser->id,
+        'entity_type' => ImportEntityType::People,
+        'file_name' => 'test.csv',
+        'status' => ImportStatus::Mapping,
+        'total_rows' => 1,
+        'headers' => ['Name', 'Email'],
+    ]);
+
+    $store = ImportStore::create($import->id);
+
+    $component = Livewire::withQueryParams(['import' => $store->id()])
+        ->test(ImportWizard::class, [
+            'entityType' => ImportEntityType::People,
+        ]);
+
+    expect($component->get('currentStep'))->toBe(1)
+        ->and($component->get('storeId'))->toBeNull();
+
+    ImportStore::delete($store->id());
+    $import->delete();
+});
+
+describe('on a remote store disk', function (): void {
+    beforeEach(function (): void {
+        useRemoteImportStore();
+    });
+
+    it('cancelImport removes the remote file and this replica read copy', function (): void {
+        $store = createFullTestStore($this);
+        $store->persist();
+        $store->close();
+        $readCache = config('import-wizard.store.read_cache_path')."/{$store->id()}";
+
+        ImportStore::forRead($store->id())?->close();
+        expect(File::isDirectory($readCache))->toBeTrue();
+
+        mountImportWizard($this, '/dashboard')
+            ->set('storeId', $store->id())
+            ->call('cancelImport')
+            ->assertRedirect('/dashboard');
+
+        Storage::disk('s3')->assertMissing("imports/{$store->id()}.sqlite");
+
+        expect(File::isDirectory($readCache))->toBeFalse()
+            ->and(ImportStore::forRead($store->id()))->toBeNull();
+
+        markStoreAsDestroyed($this, $store);
+    });
+
+    it('rejects path traversal ids on the write paths', function (): void {
+        expect(ImportStore::forExecution('../../etc/passwd', 'execute:owner'))->toBeNull()
+            ->and(fn () => ImportStore::withWriteLock('../../etc/passwd', fn (): null => null))->toThrow(ImportStoreException::class);
+    });
+
+    it('drops the connection config of a read copy when it closes', function (): void {
+        $store = createFullTestStore($this);
+        $store->persist();
+        $store->close();
+
+        ImportStore::forRead($store->id())?->close();
+
+        expect(collect(array_keys((array) config('database.connections')))->filter(fn (string $name): bool => str_starts_with($name, "import_read_{$store->id()}_")))->toBeEmpty();
+    });
+
+    it('prunes read copies of other imports that sat unused for a day', function (): void {
+        $store = createFullTestStore($this);
+        $store->persist();
+        $store->close();
+        $readCache = config('import-wizard.store.read_cache_path');
+        $stale = "{$readCache}/".Str::ulid();
+        $recent = "{$readCache}/".Str::ulid();
+        File::ensureDirectoryExists($stale);
+        File::ensureDirectoryExists($recent);
+        touch($stale, now()->subHours(25)->getTimestamp());
+        touch($recent, now()->subHours(23)->getTimestamp());
+        clearstatcache();
+
+        ImportStore::forRead($store->id())?->close();
+
+        expect(File::isDirectory($stale))->toBeFalse()
+            ->and(File::isDirectory($recent))->toBeTrue()
+            ->and(File::isDirectory("{$readCache}/{$store->id()}"))->toBeTrue();
+
+        File::deleteDirectory($recent);
+    });
+});

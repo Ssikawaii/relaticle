@@ -1,0 +1,333 @@
+<?php
+
+declare(strict_types=1);
+
+use App\Enums\CreationSource;
+use App\Filament\Resources\CompanyResource;
+use App\Filament\Resources\CompanyResource\Pages\ListCompanies;
+use App\Filament\Resources\CompanyResource\Pages\ViewCompany;
+use App\Filament\Resources\CompanyResource\RelationManagers\MeetingsRelationManager;
+use App\Models\Company;
+use App\Models\CustomField;
+use App\Models\User;
+use Filament\Actions\Testing\TestAction;
+use Filament\Facades\Filament;
+use Filament\Forms\Components\RichEditor;
+use Filament\Schemas\Components\Component;
+use Filament\Tables\Columns\Column;
+use Illuminate\Database\Eloquent\Model;
+use Relaticle\CustomFields\Data\CustomFieldSettingsData;
+
+mutates(CompanyResource::class);
+
+beforeEach(function () {
+    $this->user = User::factory()->withWorkspace()->create();
+    $this->actingAs($this->user);
+    $this->workspace = $this->user->currentWorkspace;
+    Filament::setTenant($this->workspace);
+    Filament::setCurrentPanel(Filament::getPanel('app'));
+});
+
+it('can render the index page', function (): void {
+    livewire(ListCompanies::class)
+        ->assertOk();
+});
+
+it('can render the view page', function (): void {
+    $record = Company::factory()->recycle([$this->user, $this->workspace])->create();
+
+    livewire(ViewCompany::class, ['record' => $record->getKey()])
+        ->assertOk();
+});
+
+it('registers the meetings relation manager on the company view page', function (): void {
+    $record = Company::factory()->recycle([$this->user, $this->workspace])->create();
+
+    $managers = livewire(ViewCompany::class, ['record' => $record->getKey()])
+        ->instance()
+        ->getRelationManagers();
+
+    expect($managers)->toContain(MeetingsRelationManager::class);
+});
+
+// Column metadata is checked against a single mounted table rather than one
+// dataset case per column: mounting the page dominates the cost, and Filament's
+// assertion messages already name the offending column.
+it('exposes the expected table columns', function (): void {
+    $columns = ['name', 'accountOwner.name', 'creator.name', 'deleted_at', 'created_at', 'updated_at'];
+    $renderable = ['name', 'accountOwner.name', 'creator.name', 'created_at', 'updated_at'];
+
+    $table = livewire(ListCompanies::class);
+
+    foreach ($columns as $column) {
+        $table->assertTableColumnExists($column)
+            ->assertTableColumnVisible($column);
+    }
+
+    foreach ($renderable as $column) {
+        $table->assertCanRenderTableColumn($column);
+    }
+
+    $table->assertCanNotRenderTableColumn('deleted_at');
+});
+
+it('can sort `:dataset` column', function (string $column): void {
+    $records = Company::factory(3)->recycle([$this->user, $this->workspace])->create();
+
+    $sortingKey = data_get($records->first(), $column) instanceof BackedEnum
+        ? fn (Model $record) => data_get($record, $column)->value
+        : $column;
+
+    livewire(ListCompanies::class)
+        ->sortTable($column)
+        ->assertCanSeeTableRecords($records->sortBy($sortingKey), inOrder: true)
+        ->sortTable($column, 'desc')
+        ->assertCanSeeTableRecords($records->sortByDesc($sortingKey), inOrder: true);
+})->with(['name', 'accountOwner.name', 'creator.name', 'deleted_at', 'created_at', 'updated_at']);
+
+it('can search `:dataset` column', function (string $column): void {
+    $records = Company::factory(3)->recycle([$this->user, $this->workspace])->create();
+    $search = data_get($records->first(), $column);
+
+    $visibleRecords = $records->filter(fn (Model $record) => data_get($record, $column) === $search);
+
+    livewire(ListCompanies::class)
+        ->searchTable($search instanceof BackedEnum ? $search->value : $search)
+        ->assertCanSeeTableRecords($visibleRecords)
+        ->assertCountTableRecords($visibleRecords->count());
+})->with(['name', 'accountOwner.name', 'creator.name']);
+
+it('cannot display trashed records by default', function (): void {
+    $records = Company::factory()->count(4)->recycle([$this->user, $this->workspace])->create();
+    $trashedRecords = Company::factory()->trashed()->count(6)->recycle([$this->user, $this->workspace])->create();
+
+    livewire(ListCompanies::class)
+        ->assertCanSeeTableRecords($records)
+        ->assertCanNotSeeTableRecords($trashedRecords)
+        ->assertCountTableRecords(4);
+});
+
+it('can paginate records', function (): void {
+    $records = Company::factory(30)->recycle([$this->user, $this->workspace])->create();
+
+    // Fetch records with the same sort order as the table (created_at DESC)
+    $sortedRecords = Company::query()
+        ->whereIn('id', $records->pluck('id'))
+        ->orderBy('created_at', 'desc')
+        ->get();
+
+    livewire(ListCompanies::class)
+        ->assertCanSeeTableRecords($sortedRecords->take(25), inOrder: true)
+        ->call('gotoPage', 2)
+        ->assertCanSeeTableRecords($sortedRecords->skip(25), inOrder: true);
+});
+
+it('offers a per page choice only once there is more than one page of records', function (): void {
+    Company::factory(25)->recycle([$this->user, $this->workspace])->create();
+
+    livewire(ListCompanies::class)
+        ->assertDontSeeHtml('fi-pagination-records-per-page-select');
+
+    Company::factory()->recycle([$this->user, $this->workspace])->create();
+
+    livewire(ListCompanies::class)
+        ->assertSeeHtml('fi-pagination-records-per-page-select');
+});
+
+it('can bulk delete records', function (): void {
+    $records = Company::factory(5)->recycle([$this->user, $this->workspace])->create();
+
+    livewire(ListCompanies::class)
+        ->assertCanSeeTableRecords($records)
+        ->selectTableRecords($records)
+        // NOTE: Using direct action array instead of TestAction::make()->bulk()
+        // because TestAction triggers unnecessary form building during bulk actions
+        ->callAction([['name' => 'delete', 'context' => ['table' => true, 'bulk' => true]]])
+        ->assertNotified()
+        ->assertCanNotSeeTableRecords($records);
+
+    $this->assertSoftDeleted($records);
+});
+
+it('can create a company', function (): void {
+    livewire(ListCompanies::class)
+        ->callAction('create', data: [
+            'name' => 'Acme Corp',
+        ])
+        ->assertHasNoActionErrors();
+
+    $this->assertDatabaseHas(Company::class, [
+        'name' => 'Acme Corp',
+        'workspace_id' => $this->workspace->id,
+    ]);
+});
+
+it('can edit a company', function (): void {
+    $record = Company::factory()->recycle([$this->user, $this->workspace])->create();
+
+    livewire(ListCompanies::class)
+        ->callAction(TestAction::make('edit')->table($record), data: [
+            'name' => 'Updated Company',
+        ])
+        ->assertHasNoActionErrors();
+
+    expect($record->refresh()->name)->toBe('Updated Company');
+});
+
+it('can delete a company', function (): void {
+    $record = Company::factory()->recycle([$this->user, $this->workspace])->create();
+
+    livewire(ListCompanies::class)
+        ->callAction(TestAction::make('delete')->table($record));
+
+    $this->assertSoftDeleted($record);
+});
+
+it('validates name is required on create', function (): void {
+    livewire(ListCompanies::class)
+        ->callAction('create', data: [
+            'name' => null,
+        ])
+        ->assertHasActionErrors(['name' => 'required']);
+});
+
+it('has `:dataset` filter', function (string $filter): void {
+    livewire(ListCompanies::class)
+        ->assertTableFilterExists($filter);
+})->with(['creation_source', 'trashed']);
+
+it('sets creator_id and workspace_id via observer when creating a company', function (): void {
+    livewire(ListCompanies::class)
+        ->callAction('create', data: [
+            'name' => 'Observer Test Corp',
+        ])
+        ->assertHasNoActionErrors();
+
+    $company = Company::query()->where('name', 'Observer Test Corp')->first();
+
+    expect($company->creator_id)->toBe($this->user->id)
+        ->and($company->workspace_id)->toBe($this->workspace->id);
+});
+
+it('authorizes workspace member to view and update own workspace company', function (): void {
+    $record = Company::factory()->recycle([$this->user, $this->workspace])->create();
+
+    expect($this->user->can('view', $record))->toBeTrue()
+        ->and($this->user->can('update', $record))->toBeTrue()
+        ->and($this->user->can('delete', $record))->toBeTrue();
+});
+
+it('denies non-workspace-member from viewing another workspace company', function (): void {
+    $otherUser = User::factory()->withWorkspace()->create();
+    $otherWorkspace = $otherUser->currentWorkspace;
+
+    $this->actingAs($otherUser);
+    $record = Company::factory()->for($otherWorkspace)->create();
+    $this->actingAs($this->user);
+
+    expect($this->user->can('view', $record))->toBeFalse()
+        ->and($this->user->can('update', $record))->toBeFalse()
+        ->and($this->user->can('delete', $record))->toBeFalse();
+});
+
+// --- Issue #282 Bug 3: adding a new tag while editing adds it to the option list ---
+
+it('adds a newly typed tags-input value to the option list when editing a company', function (): void {
+    $cf = CustomField::forceCreate([
+        'tenant_id' => $this->workspace->id,
+        'code' => 'edit_labels282',
+        'name' => 'Edit Labels',
+        'type' => 'tags-input',
+        'entity_type' => 'company',
+        'sort_order' => 50,
+        'active' => true,
+        'system_defined' => false,
+        'validation_rules' => [],
+        'settings' => new CustomFieldSettingsData,
+    ]);
+    $cf->options()->forceCreate([
+        'custom_field_id' => $cf->id,
+        'tenant_id' => $this->workspace->id,
+        'name' => 'Existing',
+        'sort_order' => 1,
+    ]);
+
+    $company = Company::factory()->recycle([$this->user, $this->workspace])->create();
+
+    livewire(ListCompanies::class)
+        ->callAction(
+            TestAction::make('edit')->table($company),
+            data: [
+                'name' => $company->name,
+                'custom_fields' => ['edit_labels282' => ['Existing', 'TypedDuringEdit']],
+            ],
+        )
+        ->assertHasNoActionErrors();
+
+    $optionNames = $cf->refresh()->options->pluck('name')->all();
+    expect($optionNames)->toContain('Existing')
+        ->toContain('TypedDuringEdit');
+});
+
+it('keeps the slash menu but not the document canvas on a rich-editor field added to companies', function (): void {
+    CustomField::forceCreate([
+        'tenant_id' => $this->workspace->id,
+        'code' => 'account_plan',
+        'name' => 'Account plan',
+        'type' => 'rich-editor',
+        'entity_type' => 'company',
+        'sort_order' => 50,
+        'active' => true,
+        'system_defined' => false,
+        'validation_rules' => [],
+        'settings' => new CustomFieldSettingsData,
+    ]);
+
+    $page = livewire(ListCompanies::class)
+        ->mountAction('create')
+        ->instance();
+
+    $editor = collect($page->getSchema($page->getMountedActionSchemaName())->getFlatComponents(withHidden: true))
+        ->first(fn (Component $component): bool => $component instanceof RichEditor);
+
+    expect($editor->getToolbarButtons())->toBe([])
+        ->and($editor->getExtraAttributes())->toHaveKey('data-slash-menu')
+        ->and($editor->getExtraAttributes())->not->toHaveKey('class');
+});
+
+it('records a company created in the panel as created on the web', function (): void {
+    livewire(ListCompanies::class)
+        ->callAction('create', data: ['name' => 'Panel Made'])
+        ->assertHasNoActionErrors();
+
+    expect(Company::query()->where('name', 'Panel Made')->sole()->creation_source)->toBe(CreationSource::WEB);
+});
+
+it('heads every column but the record name with an icon and an escaped label', function (): void {
+    CustomField::forceCreate([
+        'tenant_id' => $this->workspace->id,
+        'code' => 'tier',
+        'name' => '<b>Tier</b>',
+        'type' => 'text',
+        'entity_type' => 'company',
+        'sort_order' => 50,
+        'active' => true,
+        'system_defined' => false,
+        'validation_rules' => [],
+        'settings' => new CustomFieldSettingsData,
+    ]);
+
+    $hasIcon = fn (Column $column): bool => str_contains((string) $column->getLabel(), '<svg');
+
+    livewire(ListCompanies::class)
+        ->assertTableColumnExists('name', fn (Column $column): bool => ! $hasIcon($column))
+        ->assertTableColumnExists('accountOwner.name', $hasIcon)
+        ->assertTableColumnExists('created_at', $hasIcon)
+        ->assertTableColumnExists('custom_fields.tier', function (Column $column) use ($hasIcon): bool {
+            $label = (string) $column->getLabel();
+
+            return $hasIcon($column)
+                && str_contains($label, '&lt;b&gt;Tier&lt;/b&gt;')
+                && ! str_contains($label, '<b>Tier</b>');
+        });
+});

@@ -1,0 +1,597 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Relaticle\ImportWizard\Livewire\Steps;
+
+use Carbon\CarbonImmutable;
+use Closure;
+use Illuminate\Bus\Batch;
+use Illuminate\Contracts\Pagination\LengthAwarePaginator;
+use Illuminate\Database\Connection;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Bus;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\View\View;
+use Livewire\Attributes\Computed;
+use Livewire\Attributes\Locked;
+use Livewire\Component;
+use Livewire\WithPagination;
+use Relaticle\ImportWizard\Data\ColumnData;
+use Relaticle\ImportWizard\Enums\DateFormat;
+use Relaticle\ImportWizard\Enums\ImportStatus;
+use Relaticle\ImportWizard\Enums\NumberFormat;
+use Relaticle\ImportWizard\Enums\ReviewFilter;
+use Relaticle\ImportWizard\Enums\SortDirection;
+use Relaticle\ImportWizard\Enums\SortField;
+use Relaticle\ImportWizard\Jobs\ResolveMatchesJob;
+use Relaticle\ImportWizard\Jobs\ValidateColumnJob;
+use Relaticle\ImportWizard\Livewire\Concerns\WithImportStore;
+use Relaticle\ImportWizard\Store\ImportRow;
+use Relaticle\ImportWizard\Store\ImportStore;
+use Relaticle\ImportWizard\Support\EntityLinkValidator;
+use Relaticle\ImportWizard\Support\Validation\ColumnValidator;
+use Relaticle\ImportWizard\Support\Validation\ValidationError;
+
+final class ReviewStep extends Component
+{
+    use WithImportStore;
+    use WithPagination;
+
+    private const string REENTRY = '__reentry';
+
+    public string $search = '';
+
+    public ReviewFilter $filter = ReviewFilter::All;
+
+    public SortField $sortField = SortField::Count;
+
+    public SortDirection $sortDirection = SortDirection::Desc;
+
+    /** @var Collection<int, ColumnData> */
+    public Collection $columns;
+
+    public ColumnData $selectedColumn;
+
+    /** @var array<string, string> Column source => batch ID */
+    public array $batchIds = [];
+
+    /** @var array<string, bool> */
+    public array $failedColumns = [];
+
+    #[Locked]
+    public int $rowRevision = 0;
+
+    private function selectedColumnJsonPath(): string
+    {
+        return "$.{$this->selectedColumn->source}";
+    }
+
+    private function validateValue(ColumnData $column, string $value, bool $isCorrection = false): ?string
+    {
+        if ($column->isEntityLinkMapping()) {
+            return $this->validateEntityLinkValue($column, $value);
+        }
+
+        if ($isCorrection && $column->getType()->isDateOrDateTime()) {
+            return DateFormat::ISO->parse($value, $column->getType()->isTimestamp()) instanceof CarbonImmutable
+                ? null
+                : 'Invalid date format';
+        }
+
+        return (new ColumnValidator)->validate($column, $value)?->toStorageFormat();
+    }
+
+    private function validateEntityLinkValue(ColumnData $column, string $value): ?string
+    {
+        $validator = new EntityLinkValidator($this->import()->workspace_id);
+
+        return $validator->validateFromColumn($column, $this->import()->getImporter(), $value);
+    }
+
+    private function updateValidationForRawValue(Connection $connection, string $jsonPath, string $rawValue, ?string $error): void
+    {
+        if ($error === null) {
+            $connection->statement('
+                UPDATE import_rows
+                SET validation = json_remove(validation, ?)
+                WHERE json_extract(raw_data, ?) = ?
+            ', [$jsonPath, $jsonPath, $rawValue]);
+
+            return;
+        }
+
+        $connection->statement("
+            UPDATE import_rows
+            SET validation = json_set(COALESCE(validation, '{}'), ?, ?)
+            WHERE json_extract(raw_data, ?) = ?
+        ", [$jsonPath, $error, $jsonPath, $rawValue]);
+    }
+
+    private function validateColumnAsync(ColumnData $column): string
+    {
+        unset($this->failedColumns[$column->source]);
+
+        $oldBatchId = $this->batchIds[$column->source] ?? null;
+
+        if ($oldBatchId !== null) {
+            Bus::findBatch($oldBatchId)?->cancel();
+        }
+
+        $batch = Bus::batch([
+            new ValidateColumnJob($this->import()->id, $column),
+        ])
+            ->name("Validate {$column->source}")
+            ->onQueue('imports')
+            ->dispatch();
+
+        $this->dispatch('validation-started');
+
+        return $batch->id;
+    }
+
+    private function revalidateEntityLinkColumn(): void
+    {
+        if (! $this->selectedColumn->isEntityLinkMapping()) {
+            return;
+        }
+
+        $this->batchIds[$this->selectedColumn->source] = $this->validateColumnAsync($this->selectedColumn);
+        $this->cacheValidationState($this->currentMappingsHash());
+    }
+
+    private function writeRow(Closure $mutator): bool
+    {
+        $written = $this->writeStore($mutator);
+
+        if (! $written) {
+            $this->rowRevision++;
+        }
+
+        return $written;
+    }
+
+    private function clearRelationshipsForReentry(): bool
+    {
+        return $this->writeStore(function (ImportStore $store): void {
+            $store->connection()->statement('UPDATE import_rows SET relationships = NULL');
+        });
+    }
+
+    private function dispatchMatchResolution(): string
+    {
+        $batch = Bus::batch([
+            new ResolveMatchesJob(
+                importId: $this->import()->id,
+            ),
+        ])
+            ->name('Match resolution')
+            ->onQueue('imports')
+            ->dispatch();
+
+        return $batch->id;
+    }
+
+    public function mount(): void
+    {
+        $this->columns = $this->import()->columnMappings();
+        $this->selectedColumn = $this->columns->first();
+
+        $currentHash = $this->currentMappingsHash();
+        $cached = Cache::get($this->validationCacheKey());
+
+        if ($cached !== null && $cached['hash'] === $currentHash) {
+            $this->batchIds = $this->filterRunningBatches($cached['batch_ids']);
+            $this->checkProgress();
+
+            return;
+        }
+
+        $this->cancelOldBatches($cached);
+        $this->startValidation();
+    }
+
+    private function startValidation(): void
+    {
+        if (! $this->clearRelationshipsForReentry()) {
+            $this->failedColumns[self::REENTRY] = true;
+
+            return;
+        }
+
+        foreach ($this->columns as $column) {
+            $this->batchIds[$column->source] = $this->validateColumnAsync($column);
+        }
+
+        $this->batchIds['__match_resolution'] = $this->dispatchMatchResolution();
+
+        $this->cacheValidationState($this->currentMappingsHash());
+    }
+
+    public function hydrate(): void
+    {
+        $this->columns = $this->import()->columnMappings();
+        $this->selectedColumn = $this->import()->getColumnMapping($this->selectedColumn->source);
+    }
+
+    public function render(): View
+    {
+        return view('import-wizard-new::livewire.steps.review-step');
+    }
+
+    /** @return LengthAwarePaginator<int, ImportRow> */
+    #[Computed]
+    public function selectedColumnRows(): LengthAwarePaginator
+    {
+        $column = $this->selectedColumn->source;
+
+        return $this->store()->query()
+            ->uniqueValuesFor($column)
+            ->forFilter($this->filter, $column)
+            ->when(filled($this->search), fn (Builder $q) => $q->searchValue($column, $this->search))
+            ->orderBy($this->sortField->value, $this->sortDirection->value)
+            ->paginate(100);
+    }
+
+    /** @return array<string, int> */
+    #[Computed]
+    public function filterCounts(): array
+    {
+        return ImportRow::countUniqueValuesByFilter(
+            $this->store()->query(),
+            $this->selectedColumn->source
+        );
+    }
+
+    public function selectColumn(string $columnSource): void
+    {
+        $this->selectedColumn = $this->columns->firstWhere('source', $columnSource);
+        $this->setFilter(ReviewFilter::All->value);
+    }
+
+    /** @return array<int, array{label: string, value: string}> */
+    #[Computed]
+    public function choiceOptions(): array
+    {
+        if (! $this->selectedColumn->isMultiChoicePredefined()) {
+            return [];
+        }
+
+        return $this->selectedColumn->importField->options ?? [];
+    }
+
+    public function setFilter(string $filter): void
+    {
+        $this->filter = ReviewFilter::from($filter);
+        $this->resetPage();
+    }
+
+    public function setSortField(string $field): void
+    {
+        $this->sortField = SortField::from($field);
+        $this->resetPage();
+    }
+
+    public function setSortDirection(string $direction): void
+    {
+        $this->sortDirection = SortDirection::from($direction);
+        $this->resetPage();
+    }
+
+    public function clearFilters(): void
+    {
+        $this->search = '';
+        $this->filter = ReviewFilter::All;
+        $this->resetPage();
+    }
+
+    public function updatedSearch(): void
+    {
+        $this->resetPage();
+    }
+
+    public function setColumnFormat(string $type, string $value): void
+    {
+        $currentValue = match ($type) {
+            'date' => $this->selectedColumn->dateFormat?->value,
+            'number' => $this->selectedColumn->numberFormat?->value,
+            default => null,
+        };
+
+        if ($currentValue === $value) {
+            return;
+        }
+
+        $updated = match ($type) {
+            'date' => $this->selectedColumn->withDateFormat(DateFormat::from($value)),
+            'number' => $this->selectedColumn->withNumberFormat(NumberFormat::from($value)),
+            default => throw new \InvalidArgumentException("Unknown format type: {$type}"),
+        };
+
+        $this->import()->updateColumnMapping($this->selectedColumn->source, $updated);
+
+        $this->columns = $this->columns->map(
+            fn (ColumnData $col): ColumnData => $col->source === $updated->source ? $updated : $col
+        );
+        $this->selectedColumn = $updated;
+
+        $this->batchIds[$this->selectedColumn->source] = $this->validateColumnAsync($this->selectedColumn);
+
+        $this->cacheValidationState($this->currentMappingsHash());
+    }
+
+    /** @return array<string, string>|null */
+    public function updateMappedValue(string $rawValue, string $newValue): ?array
+    {
+        if (blank($newValue)) {
+            return $this->skip($rawValue) ? [] : null;
+        }
+
+        $error = $this->validateValue($this->selectedColumn, $newValue, isCorrection: true);
+        $jsonPath = $this->selectedColumnJsonPath();
+
+        $written = $this->writeRow(function (ImportStore $store) use ($jsonPath, $newValue, $rawValue, $error): void {
+            $store->connection()->statement("
+                UPDATE import_rows
+                SET corrections = json_set(COALESCE(corrections, '{}'), ?, ?)
+                WHERE json_extract(raw_data, ?) = ?
+            ", [$jsonPath, $newValue, $jsonPath, $rawValue]);
+
+            $this->updateValidationForRawValue($store->connection(), $jsonPath, $rawValue, $error);
+        });
+
+        if (! $written) {
+            return null;
+        }
+
+        $this->revalidateEntityLinkColumn();
+
+        unset($this->columnErrorStatuses);
+
+        if ($error === null || ! $this->selectedColumn->isMultiChoiceArbitrary()) {
+            return [];
+        }
+
+        $validationError = ValidationError::fromStorageFormat($error);
+
+        return $validationError?->getItemErrors() ?? [];
+    }
+
+    public function undoCorrection(string $rawValue): void
+    {
+        $error = $this->validateValue($this->selectedColumn, $rawValue, isCorrection: false);
+        $jsonPath = $this->selectedColumnJsonPath();
+
+        $written = $this->writeRow(function (ImportStore $store) use ($jsonPath, $rawValue, $error): void {
+            $store->connection()->statement('
+                UPDATE import_rows
+                SET corrections = json_remove(corrections, ?)
+                WHERE json_extract(raw_data, ?) = ?
+            ', [$jsonPath, $jsonPath, $rawValue]);
+
+            $this->updateValidationForRawValue($store->connection(), $jsonPath, $rawValue, $error);
+        });
+
+        if (! $written) {
+            return;
+        }
+
+        $this->revalidateEntityLinkColumn();
+
+        unset($this->columnErrorStatuses);
+    }
+
+    public function skipValue(string $rawValue): void
+    {
+        $this->skip($rawValue);
+    }
+
+    private function skip(string $rawValue): bool
+    {
+        $jsonPath = $this->selectedColumnJsonPath();
+        $error = $this->validateValue($this->selectedColumn, $rawValue, isCorrection: false);
+
+        $written = $this->writeRow(function (ImportStore $store) use ($jsonPath, $rawValue, $error): void {
+            $store->connection()->statement("
+                UPDATE import_rows
+                SET skipped = json_set(COALESCE(skipped, '{}'), ?, json('true')),
+                    corrections = json_remove(corrections, ?)
+                WHERE json_extract(raw_data, ?) = ?
+            ", [$jsonPath, $jsonPath, $jsonPath, $rawValue]);
+
+            $this->updateValidationForRawValue($store->connection(), $jsonPath, $rawValue, $error);
+        });
+
+        if (! $written) {
+            return false;
+        }
+
+        $this->revalidateEntityLinkColumn();
+
+        unset($this->columnErrorStatuses);
+
+        return true;
+    }
+
+    public function unskipValue(string $rawValue): void
+    {
+        $jsonPath = $this->selectedColumnJsonPath();
+
+        $written = $this->writeRow(function (ImportStore $store) use ($jsonPath, $rawValue): void {
+            $store->connection()->statement('
+                UPDATE import_rows
+                SET skipped = json_remove(skipped, ?)
+                WHERE json_extract(raw_data, ?) = ?
+            ', [$jsonPath, $jsonPath, $rawValue]);
+        });
+
+        if (! $written) {
+            return;
+        }
+
+        $this->revalidateEntityLinkColumn();
+
+        unset($this->columnErrorStatuses);
+    }
+
+    public function checkProgress(): void
+    {
+        $stateChanged = false;
+
+        foreach ($this->batchIds as $columnSource => $batchId) {
+            $batch = Bus::findBatch($batchId);
+
+            if ($this->batchFailed($batch)) {
+                $stateChanged = $stateChanged || ! isset($this->failedColumns[$columnSource]);
+                $this->failedColumns[$columnSource] = true;
+
+                continue;
+            }
+
+            if ($batch?->finished()) {
+                unset($this->batchIds[$columnSource], $this->failedColumns[$columnSource]);
+                $this->dispatch('validation-complete', column: $columnSource);
+                $stateChanged = true;
+            }
+        }
+
+        if ($stateChanged) {
+            unset($this->columnErrorStatuses);
+            $this->cacheValidationState($this->currentMappingsHash());
+        }
+
+        if (array_diff_key($this->batchIds, $this->failedColumns) === []) {
+            $this->dispatch('polling-complete');
+        }
+    }
+
+    public function retryFailedValidation(): void
+    {
+        if (isset($this->failedColumns[self::REENTRY])) {
+            unset($this->failedColumns[self::REENTRY]);
+            $this->startValidation();
+            $this->dispatch('validation-started');
+
+            return;
+        }
+
+        foreach (array_keys($this->failedColumns) as $columnSource) {
+            unset($this->failedColumns[$columnSource]);
+
+            if ($columnSource === '__match_resolution') {
+                $this->batchIds[$columnSource] = $this->dispatchMatchResolution();
+
+                continue;
+            }
+
+            $column = $this->columns->firstWhere('source', $columnSource);
+
+            if ($column instanceof ColumnData) {
+                $this->batchIds[$columnSource] = $this->validateColumnAsync($column);
+            }
+        }
+
+        $this->cacheValidationState($this->currentMappingsHash());
+        $this->dispatch('validation-started');
+    }
+
+    #[Computed]
+    public function isSelectedColumnValidating(): bool
+    {
+        return isset($this->batchIds[$this->selectedColumn->source])
+            && ! isset($this->failedColumns[$this->selectedColumn->source]);
+    }
+
+    #[Computed]
+    public function isValidating(): bool
+    {
+        return array_any(
+            array_keys($this->batchIds),
+            fn (string $key): bool => $key !== '__match_resolution'
+        );
+    }
+
+    /** @return array<string, bool> */
+    #[Computed(persist: true, seconds: 60)]
+    public function columnErrorStatuses(): array
+    {
+        $columnSources = $this->columns->pluck('source')->all();
+
+        return ImportRow::getColumnErrorStatuses($this->store()->query(), $columnSources);
+    }
+
+    public function continueToPreview(): void
+    {
+        if ($this->isValidating() || $this->failedColumns !== []) {
+            return;
+        }
+
+        $matchBatchId = $this->batchIds['__match_resolution'] ?? null;
+
+        if ($matchBatchId !== null) {
+            Cache::put(
+                "import-{$this->storeId}-match-resolution-batch",
+                $matchBatchId,
+                now()->addHour(),
+            );
+        }
+
+        $this->import()->update(['status' => ImportStatus::Previewing]);
+        $this->dispatch('completed');
+    }
+
+    private function currentMappingsHash(): string
+    {
+        $mappings = $this->import()->column_mappings ?? [];
+
+        return hash('xxh128', (string) json_encode($mappings));
+    }
+
+    private function validationCacheKey(): string
+    {
+        return "import-{$this->storeId}-validation";
+    }
+
+    private function cacheValidationState(string $hash): void
+    {
+        if (isset($this->failedColumns[self::REENTRY])) {
+            return;
+        }
+
+        Cache::put($this->validationCacheKey(), [
+            'hash' => $hash,
+            'batch_ids' => $this->batchIds,
+        ], now()->addHour());
+    }
+
+    /**
+     * @param  array<string, string>  $batchIds
+     * @return array<string, string>
+     */
+    private function filterRunningBatches(array $batchIds): array
+    {
+        return array_filter($batchIds, function (string $batchId): bool {
+            $batch = Bus::findBatch($batchId);
+
+            return $this->batchFailed($batch) || ! $batch?->finished();
+        });
+    }
+
+    private function batchFailed(?Batch $batch): bool
+    {
+        return ! $batch instanceof Batch || $batch->cancelled() || $batch->hasFailures();
+    }
+
+    /** @param array{hash: string, batch_ids: array<string, string>}|null $cached */
+    private function cancelOldBatches(?array $cached): void
+    {
+        if ($cached === null) {
+            return;
+        }
+
+        foreach ($cached['batch_ids'] as $batchId) {
+            Bus::findBatch($batchId)?->cancel();
+        }
+    }
+}

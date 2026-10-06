@@ -1,0 +1,118 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Relaticle\Chat\Tools\Opportunity;
+
+use App\Actions\Opportunity\UpdateOpportunity;
+use App\Concerns\OperatesOnCrmEntity;
+use App\Enums\CrmEntity;
+use App\Models\Company;
+use App\Models\People;
+use App\Models\User;
+use Illuminate\Contracts\JsonSchema\JsonSchema;
+use Illuminate\Database\Eloquent\Model;
+use Laravel\Ai\Tools\Request;
+use Relaticle\Chat\Tools\BaseWriteUpdateTool;
+
+final class UpdateOpportunityTool extends BaseWriteUpdateTool
+{
+    use OperatesOnCrmEntity;
+
+    public function description(): string
+    {
+        return 'Propose updating an existing opportunity/deal, including its linked company and primary contact.';
+    }
+
+    protected function entity(): CrmEntity
+    {
+        return CrmEntity::Opportunity;
+    }
+
+    protected function actionClass(): string
+    {
+        return UpdateOpportunity::class;
+    }
+
+    protected function ownedForeignKeys(): array
+    {
+        return [
+            'company_id' => Company::class,
+            'contact_id' => People::class,
+        ];
+    }
+
+    protected function entitySchema(JsonSchema $schema): array
+    {
+        return [
+            'name' => $schema->string()->description('The new opportunity name.'),
+            'company_id' => $schema->string()->description('The new linked company ULID. Pass null to unlink the company.'),
+            'contact_id' => $schema->string()->description('The new linked primary contact (people) ULID. Pass null to unlink the contact.'),
+        ];
+    }
+
+    protected function extractActionData(Request $request): array
+    {
+        $data = array_filter(['name' => $request['name'] ?? null], static fn (mixed $v): bool => $v !== null && $v !== '');
+
+        foreach (['company_id', 'contact_id'] as $key) {
+            if (array_key_exists($key, $request->all())) {
+                $data[$key] = $this->stringOrNull($request, $key);
+            }
+        }
+
+        return $data;
+    }
+
+    protected function buildDisplayData(Request $request, Model $model): array
+    {
+        /** @var User $user */
+        $user = auth()->user();
+        $workspace = $user->currentWorkspace;
+
+        $fields = [];
+
+        if (($request['name'] ?? null) !== null && $request['name'] !== '') {
+            $fields[] = [
+                'label' => 'Name',
+                'old' => $model->getAttribute('name'),
+                'new' => $request['name'],
+            ];
+        }
+
+        if (array_key_exists('company_id', $request->all())) {
+            $newCompanyId = $this->stringOrNull($request, 'company_id');
+            $fields[] = [
+                'label' => 'Company',
+                'old' => $this->recordNames()->name($model->getAttribute('company_id'), Company::class, $workspace),
+                'new' => $newCompanyId === null ? __('(none)') : $this->recordNames()->name($newCompanyId, Company::class, $workspace),
+                '_oldValue' => $model->getAttribute('company_id'),
+                '_newValue' => $newCompanyId,
+            ];
+        }
+
+        if (array_key_exists('contact_id', $request->all())) {
+            $newContactId = $this->stringOrNull($request, 'contact_id');
+            $fields[] = [
+                'label' => 'Point of Contact',
+                'old' => $this->recordNames()->name($model->getAttribute('contact_id'), People::class, $workspace),
+                'new' => $newContactId === null ? __('(none)') : $this->recordNames()->name($newContactId, People::class, $workspace),
+                '_oldValue' => $model->getAttribute('contact_id'),
+                '_newValue' => $newContactId,
+            ];
+        }
+
+        return [
+            'title' => 'Update Opportunity',
+            'summary' => "Update opportunity \"{$model->getAttribute('name')}\"",
+            'fields' => $fields,
+        ];
+    }
+
+    private function stringOrNull(Request $request, string $key): ?string
+    {
+        $value = $request[$key] ?? null;
+
+        return is_string($value) && $value !== '' ? $value : null;
+    }
+}

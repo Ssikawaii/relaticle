@@ -1,0 +1,67 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Relaticle\Chat\Tools\Company;
+
+use App\Concerns\OperatesOnCrmEntity;
+use App\Enums\CrmEntity;
+use App\Http\Resources\V1\CompanyResource;
+use App\Http\Resources\V1\NoteResource;
+use App\Http\Resources\V1\OpportunityResource;
+use App\Http\Resources\V1\PeopleResource;
+use App\Http\Resources\V1\TaskResource;
+use App\Models\Company;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Http\Resources\Json\JsonResource;
+use Relaticle\Chat\Tools\BaseReadShowTool;
+
+final class GetCompanyTool extends BaseReadShowTool
+{
+    use OperatesOnCrmEntity;
+
+    public function description(): string
+    {
+        return 'Get a single company by ID with full details.';
+    }
+
+    protected function entity(): CrmEntity
+    {
+        return CrmEntity::Company;
+    }
+
+    protected function resourceClass(): string
+    {
+        return CompanyResource::class;
+    }
+
+    protected function eagerLoad(): array
+    {
+        return [...parent::eagerLoad(), 'accountOwner'];
+    }
+
+    /** @return array<string, class-string<JsonResource>> */
+    protected function availableIncludes(): array
+    {
+        return [
+            'people' => PeopleResource::class,
+            'opportunities' => OpportunityResource::class,
+            'notes' => NoteResource::class,
+            'tasks' => TaskResource::class,
+        ];
+    }
+
+    protected function extraPayload(Model $model): array
+    {
+        /** @var Company $company */
+        $company = $model;
+        $owner = $company->accountOwner;
+
+        return [
+            'account_owner' => $owner === null ? null : [
+                'id' => (string) $owner->getKey(),
+                'name' => (string) $owner->name,
+            ],
+        ];
+    }
+}

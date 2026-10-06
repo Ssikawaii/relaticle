@@ -1,0 +1,138 @@
+<?php
+
+declare(strict_types=1);
+
+use App\Enums\CrmEntity;
+use App\Enums\CustomFieldType;
+use App\Http\Requests\Api\V1\BaseCrmEntityRequest;
+use App\Models\User;
+use App\Providers\AppServiceProvider;
+use App\Queries\CustomFieldFilterSchema;
+use App\Queries\EntityFilters;
+use App\Scribe\Strategies\GetFilterBodyFromEntityFilters;
+use App\Scribe\Strategies\GetFilterQueryMetadata;
+use App\Scribe\Strategies\GetFromSpatieQueryBuilder;
+use App\Support\CustomFields\CustomFieldOptionMap;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\Storage;
+use Laravel\Sanctum\Sanctum;
+use Symfony\Component\Yaml\Yaml;
+
+mutates(
+    AppServiceProvider::class,
+    BaseCrmEntityRequest::class,
+    GetFilterBodyFromEntityFilters::class,
+    GetFilterQueryMetadata::class,
+    GetFromSpatieQueryBuilder::class,
+);
+
+it('generates the complete API documentation with company ownership fields', function (): void {
+    expect(Schema::hasTable('custom_fields'))->toBeTrue();
+
+    $disk = Storage::fake('local');
+    $this->app->usePublicPath($disk->path('public'));
+    config()->set('scribe.static.output_path', $disk->path('public/docs'));
+    config()->set('view.paths.0', $disk->path('views'));
+
+    $this->artisan('scribe:generate', [
+        '--force' => true,
+        '--no-interaction' => true,
+        '--scribe-dir' => $disk->path('.scribe'),
+    ])->assertSuccessful();
+
+    $disk->assertExists(['scribe/openapi.yaml', 'scribe/collection.json', 'views/scribe/index.blade.php']);
+
+    $spec = Yaml::parse($disk->get('scribe/openapi.yaml'));
+
+    expect($spec['paths']['/api/v1/companies']['post']['requestBody']['content']['application/json']['schema']['properties'])
+        ->toHaveKey('account_owner_id');
+    expect($spec['paths']['/api/v1/companies/{id}']['put']['requestBody']['content']['application/json']['schema']['properties'])
+        ->toHaveKey('account_owner_id');
+
+    $customFieldFilter = collect($spec['paths']['/api/v1/opportunities']['get']['parameters'])
+        ->firstWhere('name', 'filter[custom_fields][{code}][{operator}]');
+    $publishedOperators = collect(CustomFieldType::cases())
+        ->flatMap(fn (CustomFieldType $type): array => array_keys(CustomFieldFilterSchema::operatorsForType($type->value)))
+        ->filter(fn (string $operator): bool => str_starts_with($operator, '$'))
+        ->unique()
+        ->all();
+
+    $query = $spec['paths']['/api/v1/companies/query']['post'];
+    $queryBody = $query['requestBody']['content']['application/json']['schema']['properties'];
+    $listParameters = collect($spec['paths']['/api/v1/companies']['get']['parameters'])->keyBy('name');
+
+    expect($queryBody)->toHaveKeys(['filter', 'sort', 'include', 'per_page', 'cursor', 'page'])
+        ->and($query['parameters'])->toBe([])
+        ->and($query['description'])->toContain('`cursor` set to `meta.next_cursor`', '256 KB')
+        ->and($queryBody['sort']['description'])->toBe($listParameters['sort']['description'])
+        ->and($queryBody['include']['description'])->toBe($listParameters['include']['description'])
+        ->and($queryBody['sort']['description'])->toContain('Allowed:')
+        ->and($queryBody['per_page']['description'])->toBe($listParameters['per_page']['description'])
+        ->and($queryBody['cursor']['description'])->toBe($listParameters['cursor']['description'])
+        ->and($queryBody['page']['description'])->toBe($listParameters['page']['description']);
+
+    $user = User::factory()->withPersonalWorkspace()->create();
+    Sanctum::actingAs($user);
+
+    $entities = [
+        'companies' => CrmEntity::Company,
+        'people' => CrmEntity::People,
+        'opportunities' => CrmEntity::Opportunity,
+        'tasks' => CrmEntity::Task,
+        'notes' => CrmEntity::Note,
+    ];
+
+    foreach ($entities as $path => $entity) {
+        $filter = $spec['paths']["/api/v1/{$path}/query"]['post']['requestBody']['content']['application/json']['schema']['properties']['filter'];
+
+        expect($filter['examples'][0])->toBe(EntityFilters::example($entity))
+            ->and($filter['description'])->toBe(EntityFilters::grammar($entity));
+
+        $this->postJson("/api/v1/{$path}/query", ['filter' => $filter['examples'][0]])->assertOk();
+
+        $published = collect($spec['paths']["/api/v1/{$path}"]['get']['parameters'])->keyBy('name');
+
+        foreach (['sort', 'include'] as $parameter) {
+            $names = str($published[$parameter]['description'])->after('Allowed: ')->beforeLast('.')->explode(', ');
+
+            expect($names->all())->not->toBeEmpty()
+                ->and($names->duplicates()->all())->toBe([], "{$path} publishes a {$parameter} twice");
+
+            foreach ($names as $name) {
+                expect($this->getJson("/api/v1/{$path}?{$parameter}={$name}")->status())->toBe(200, "{$path} publishes {$parameter}={$name}, which the list refuses");
+            }
+        }
+    }
+
+    foreach (GetFromSpatieQueryBuilder::CUSTOM_FIELD_EXAMPLES as $path => $example) {
+        expect($customFieldFilter['description'])->toContain($example);
+
+        $this->getJson("/api/v1/{$path}?{$example}")->assertOk();
+    }
+
+    expect($customFieldFilter)->not->toBeNull()
+        ->and(array_diff($publishedOperators, str($customFieldFilter['description'])->matchAll('/\$[a-z_]+/')->all()))->toBe([])
+        ->and($customFieldFilter['description'])->toContain(CustomFieldFilterSchema::valueRules(), EntityFilters::limits(), CustomFieldOptionMap::choiceRule(), CustomFieldType::PHONE->filterMatching(), CustomFieldType::TAGS_INPUT->filterMatching(), 'domain sub-field with $in or $not_in');
+});
+
+it('generates the API documentation before the database is migrated', function (): void {
+    $disk = Storage::fake('local');
+    $this->app->usePublicPath($disk->path('public'));
+    config()->set('scribe.static.output_path', $disk->path('public/docs'));
+    config()->set('view.paths.0', $disk->path('views'));
+
+    DB::statement('drop schema public cascade');
+    DB::statement('create schema public');
+
+    $this->artisan('scribe:generate', [
+        '--force' => true,
+        '--no-interaction' => true,
+        '--scribe-dir' => $disk->path('.scribe'),
+    ])->assertSuccessful();
+
+    $spec = Yaml::parse($disk->get('scribe/openapi.yaml'));
+
+    expect($spec['paths']['/api/v1/tasks']['post']['requestBody']['content']['application/json']['schema']['properties'])
+        ->toHaveKeys(['assignee_ids', 'custom_fields']);
+});

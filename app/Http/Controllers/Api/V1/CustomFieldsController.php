@@ -1,0 +1,40 @@
+<?php
+
+declare(strict_types=1);
+
+namespace App\Http\Controllers\Api\V1;
+
+use App\Http\Requests\Api\V1\IndexCustomFieldsRequest;
+use App\Http\Resources\V1\CustomFieldResource;
+use App\Models\CustomField;
+use App\Models\User;
+use Illuminate\Database\Eloquent\Relations\Relation;
+use Illuminate\Http\Resources\Json\AnonymousResourceCollection;
+use Knuckles\Scribe\Attributes\ResponseFromApiResource;
+
+/**
+ * @group Custom Fields
+ *
+ * List custom field definitions configured for your workspace.
+ */
+final readonly class CustomFieldsController
+{
+    #[ResponseFromApiResource(CustomFieldResource::class, CustomField::class, collection: true, paginate: 15)]
+    public function index(IndexCustomFieldsRequest $request): AnonymousResourceCollection
+    {
+        /** @var User $user */
+        $user = $request->user();
+
+        $workspaceId = $user->currentWorkspace->getKey();
+
+        $query = CustomField::query()
+            ->withoutGlobalScopes()
+            ->where('tenant_id', $workspaceId)
+            ->active()
+            ->with(['options' => fn (Relation $q): Relation => $q->withoutGlobalScopes()]);
+
+        $query->when($request->validated('entity_type'), fn (mixed $q, string $type) => $q->where('entity_type', $type));
+
+        return CustomFieldResource::collection($query->paginate($request->safe()->integer('per_page', 15)));
+    }
+}

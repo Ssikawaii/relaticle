@@ -1,0 +1,207 @@
+<?php
+
+declare(strict_types=1);
+
+namespace App\Filament\Resources;
+
+use App\Enums\CreationSource;
+use App\Enums\CrmEntity;
+use App\Filament\Components\Forms\WorkspaceMemberSelect;
+use App\Filament\Components\RecordChip;
+use App\Filament\Components\Tables\RecordChipColumn;
+use App\Filament\Exports\CompanyExporter;
+use App\Filament\Resources\CompanyResource\Pages\ListCompanies;
+use App\Filament\Resources\CompanyResource\Pages\ViewCompany;
+use App\Filament\Resources\CompanyResource\RelationManagers\EmailsRelationManager;
+use App\Filament\Resources\CompanyResource\RelationManagers\MeetingsRelationManager;
+use App\Filament\Resources\CompanyResource\RelationManagers\NotesRelationManager;
+use App\Filament\Resources\CompanyResource\RelationManagers\PeopleRelationManager;
+use App\Filament\Resources\CompanyResource\RelationManagers\TasksRelationManager;
+use App\Models\Company;
+use Filament\Actions\ActionGroup;
+use Filament\Actions\BulkActionGroup;
+use Filament\Actions\DeleteAction;
+use Filament\Actions\DeleteBulkAction;
+use Filament\Actions\EditAction;
+use Filament\Actions\ExportBulkAction;
+use Filament\Actions\ForceDeleteAction;
+use Filament\Actions\ForceDeleteBulkAction;
+use Filament\Actions\RestoreAction;
+use Filament\Actions\RestoreBulkAction;
+use Filament\Actions\ViewAction;
+use Filament\Forms\Components\TextInput;
+use Filament\Resources\Resource;
+use Filament\Schemas\Schema;
+use Filament\Tables\Columns\TextColumn;
+use Filament\Tables\Filters\SelectFilter;
+use Filament\Tables\Filters\TrashedFilter;
+use Filament\Tables\Table;
+use Illuminate\Contracts\Support\Htmlable;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\SoftDeletingScope;
+use Relaticle\ActivityLog\Filament\RelationManagers\ActivityLogRelationManager;
+use Relaticle\CustomFields\Facades\CustomFields;
+use Relaticle\EmailIntegration\Filament\Actions\MassSendBulkAction;
+
+final class CompanyResource extends Resource
+{
+    protected static ?string $model = Company::class;
+
+    protected static ?string $recordTitleAttribute = 'name';
+
+    protected static string|\BackedEnum|null $navigationIcon = null;
+
+    protected static ?int $navigationSort = 2;
+
+    public static function form(Schema $schema): Schema
+    {
+        return $schema
+            ->components([
+                TextInput::make('name')
+                    ->required(),
+                WorkspaceMemberSelect::make('account_owner_id')
+                    ->relationship('accountOwner', 'name')
+                    ->label(__('filament/resources/company.fields.account_owner_id.label'))
+                    ->default(fn (): ?string => auth()->user()?->id)
+                    ->nullable(),
+
+                CustomFields::form()->build()->columnSpanFull()->columns(1),
+            ]);
+    }
+
+    public static function table(Table $table): Table
+    {
+        return $table
+            ->columns([
+                RecordChipColumn::make('name')
+                    ->label(__('filament/resources/company.fields.name.label'))
+                    ->searchable()
+                    ->sortable(),
+                RecordChipColumn::make('accountOwner.name')
+                    ->label(__('filament/resources/company.fields.account_owner.label'))
+                    ->searchable()
+                    ->sortable()
+                    ->toggleable(),
+                TextColumn::make('creator.name')
+                    ->label(__('filament/resources/company.fields.created_by.label'))
+                    ->searchable()
+                    ->sortable()
+                    ->toggleable()
+                    ->getStateUsing(fn (Company $record): string => $record->created_by),
+                TextColumn::make('deleted_at')
+                    ->dateTime()
+                    ->sortable()
+                    ->toggleable()
+                    ->toggledHiddenByDefault(),
+                TextColumn::make('created_at')
+                    ->label(__('filament/resources/company.fields.created_at.label'))
+                    ->dateTime()
+                    ->searchable()
+                    ->sortable()
+                    ->toggleable(),
+                // "2 hours ago" is the friendlier read, but it was the one datetime in the
+                // panel a user could not check: no absolute value and no tooltip. Keep the
+                // relative label and put the exact time behind a hover.
+                TextColumn::make('updated_at')
+                    ->label(__('filament/resources/company.fields.updated_at.label'))
+                    ->since()
+                    ->dateTimeTooltip()
+                    ->searchable()
+                    ->sortable()
+                    ->toggleable(),
+            ])
+            ->defaultSort('created_at', 'desc')
+            ->filters([
+                SelectFilter::make('creation_source')
+                    ->label(__('filament/resources/company.fields.creation_source.label'))
+                    ->options(CreationSource::class)
+                    ->multiple(),
+                TrashedFilter::make(),
+            ])
+            ->recordActions([
+                ActionGroup::make([
+                    ViewAction::make(),
+                    EditAction::make(),
+                    RestoreAction::make(),
+                    DeleteAction::make(),
+                    ForceDeleteAction::make(),
+                ]),
+            ])
+            ->toolbarActions([
+                BulkActionGroup::make([
+                    MassSendBulkAction::forCompanies(),
+                    ExportBulkAction::make()
+                        ->authorize('exportAny', Company::class)
+                        ->exporter(CompanyExporter::class),
+                    DeleteBulkAction::make(),
+                    ForceDeleteBulkAction::make(),
+                    RestoreBulkAction::make(),
+                ]),
+            ]);
+    }
+
+    public static function getRelations(): array
+    {
+        return [
+            PeopleRelationManager::class,
+            TasksRelationManager::class,
+            NotesRelationManager::class,
+            EmailsRelationManager::class,
+            MeetingsRelationManager::class,
+            ActivityLogRelationManager::class,
+        ];
+    }
+
+    public static function getPages(): array
+    {
+        return [
+            'index' => ListCompanies::route('/'),
+            'view' => ViewCompany::route('/{record}'),
+        ];
+    }
+
+    public static function getModelLabel(): string
+    {
+        return __('filament/resources/company.label');
+    }
+
+    public static function getPluralModelLabel(): string
+    {
+        return __('filament/resources/company.plural_label');
+    }
+
+    public static function getNavigationLabel(): string
+    {
+        return __('filament/resources/company.navigation_label');
+    }
+
+    public static function getNavigationIcon(): string
+    {
+        return CrmEntity::Company->icon();
+    }
+
+    public static function getGloballySearchableAttributes(): array
+    {
+        return ['name'];
+    }
+
+    public static function getGlobalSearchResultTitle(Model $record): Htmlable
+    {
+        return RecordChip::forRecord($record);
+    }
+
+    public static function getGlobalSearchEloquentQuery(): Builder
+    {
+        return parent::getGlobalSearchEloquentQuery()->with('media');
+    }
+
+    public static function getEloquentQuery(): Builder
+    {
+        return parent::getEloquentQuery()
+            ->with(['accountOwner', 'media', 'customFieldValues.customField.options'])
+            ->withoutGlobalScopes([
+                SoftDeletingScope::class,
+            ]);
+    }
+}
